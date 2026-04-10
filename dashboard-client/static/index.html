@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Ollama API Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --bg2: #1a1d27; --bg3: #22263a;
+    --border: #2e3350; --accent: #6c63ff; --accent2: #00d4aa;
+    --text: #e2e8f0; --muted: #7c87a0; --danger: #ef4444;
+    --warn: #f59e0b; --success: #10b981;
+    --font: 'Segoe UI', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); min-height: 100vh; }
+
+  /* Layout */
+  .shell { display: flex; height: 100vh; overflow: hidden; }
+  .sidebar { width: 240px; background: var(--bg2); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; flex-shrink: 0; }
+  .main { flex: 1; overflow-y: auto; padding: 24px; }
+
+  /* Sidebar */
+  .sidebar-header { padding: 20px 16px 14px; border-bottom: 1px solid var(--border); }
+  .sidebar-logo { font-size: 17px; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 8px; }
+  .sidebar-logo svg { width: 22px; height: 22px; }
+  .sidebar-sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .nav-section { padding: 12px 8px 4px; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 14px; cursor: pointer;
+    border-radius: 8px; margin: 2px 6px; font-size: 13.5px; color: var(--muted); transition: all .15s; }
+  .nav-item:hover, .nav-item.active { background: var(--bg3); color: var(--text); }
+  .nav-item.active { color: var(--accent); }
+  .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+  .servers-list { flex: 1; overflow-y: auto; border-top: 1px solid var(--border); padding: 8px; }
+  .server-nav-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px;
+    cursor: pointer; font-size: 13px; color: var(--muted); transition: all .15s; margin-bottom: 2px; }
+  .server-nav-item:hover, .server-nav-item.active { background: var(--bg3); color: var(--text); }
+  .server-nav-item .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--border); }
+  .server-nav-item .dot.online { background: var(--success); box-shadow: 0 0 6px var(--success); }
+  .server-nav-item .dot.offline { background: var(--danger); }
+  .sidebar-footer { padding: 12px; border-top: 1px solid var(--border); }
+
+  /* Topbar */
+  .topbar { display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 24px; }
+  .page-title { font-size: 20px; font-weight: 700; }
+  .page-sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  .topbar-actions { display: flex; gap: 8px; align-items: center; }
+
+  /* Cards */
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .card-title { font-size: 13px; color: var(--muted); font-weight: 500; margin-bottom: 6px; }
+  .card-value { font-size: 26px; font-weight: 700; }
+  .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 1100px) { .grid-4 { grid-template-columns: repeat(2,1fr); } }
+  @media (max-width: 700px) { .grid-4 { grid-template-columns: 1fr; } .grid-2 { grid-template-columns: 1fr; } }
+
+  /* Progress bars */
+  .progress-wrap { margin-top: 10px; }
+  .progress-bar { height: 6px; background: var(--bg3); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+  .progress-fill { height: 100%; border-radius: 4px; transition: width .4s; }
+  .fill-cpu { background: linear-gradient(90deg, var(--accent), #a78bfa); }
+  .fill-ram { background: linear-gradient(90deg, var(--accent2), #34d399); }
+  .fill-disk { background: linear-gradient(90deg, var(--warn), #fbbf24); }
+  .fill-gpu { background: linear-gradient(90deg, #ec4899, #f43f5e); }
+
+  /* Status badge */
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
+    border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .badge-online { background: rgba(16,185,129,.15); color: var(--success); }
+  .badge-offline { background: rgba(239,68,68,.15); color: var(--danger); }
+  .badge-warn { background: rgba(245,158,11,.15); color: var(--warn); }
+
+  /* Buttons */
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
+    border-radius: 8px; border: none; cursor: pointer; font-size: 13px; font-weight: 600;
+    transition: all .15s; text-decoration: none; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #5a52e0; }
+  .btn-secondary { background: var(--bg3); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--border); }
+  .btn-danger { background: rgba(239,68,68,.15); color: var(--danger); border: 1px solid rgba(239,68,68,.3); }
+  .btn-danger:hover { background: rgba(239,68,68,.3); }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-icon { padding: 7px; border-radius: 8px; background: var(--bg3); border: 1px solid var(--border); cursor: pointer; color: var(--muted); display: inline-flex; align-items: center; }
+  .btn-icon:hover { color: var(--text); background: var(--border); }
+
+  /* Table */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  thead th { padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .5px;
+    border-bottom: 1px solid var(--border); }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--bg3); }
+  tbody td { padding: 10px 14px; vertical-align: middle; }
+
+  /* Modal */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100;
+    display: flex; align-items: center; justify-content: center; }
+  .modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
+    padding: 28px; width: 480px; max-width: 95vw; }
+  .modal-title { font-size: 17px; font-weight: 700; margin-bottom: 20px; }
+  .modal-footer { margin-top: 24px; display: flex; gap: 10px; justify-content: flex-end; }
+  .hidden { display: none !important; }
+
+  /* Form */
+  .form-group { margin-bottom: 16px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--muted);
+    margin-bottom: 6px; text-transform: uppercase; letter-spacing: .4px; }
+  input, select, textarea {
+    width: 100%; padding: 9px 12px; background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-size: 13.5px; outline: none; transition: border .15s; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 60px; }
+
+  /* Section headers */
+  .section-header { display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px; }
+  .section-title { font-size: 15px; font-weight: 700; }
+
+  /* Monospace key */
+  .mono { font-family: 'Courier New', monospace; font-size: 12px; background: var(--bg3);
+    padding: 2px 7px; border-radius: 5px; color: var(--accent2); }
+
+  /* Toast */
+  #toast { position: fixed; bottom: 24px; right: 24px; z-index: 200;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 18px; font-size: 13.5px; max-width: 320px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4); transform: translateY(80px);
+    opacity: 0; transition: all .3s; pointer-events: none; }
+  #toast.show { transform: translateY(0); opacity: 1; }
+
+  /* Spinner */
+  .spin { width: 18px; height: 18px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Model pill */
+  .model-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 20px; font-size: 12.5px; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 24px; }
+  .tab { padding: 9px 16px; cursor: pointer; border-radius: 8px 8px 0 0; font-size: 13.5px;
+    color: var(--muted); font-weight: 500; }
+  .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); margin-bottom: -1px; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 48px 24px; color: var(--muted); }
+  .empty-icon { font-size: 40px; margin-bottom: 12px; }
+  .empty-title { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/>
+        </svg>
+        OllamaAPI
+      </div>
+      <div class="sidebar-sub">Local AI Infrastructure</div>
+    </div>
+    <div style="padding:8px">
+      <div class="nav-section">Navigation</div>
+      <div class="nav-item active" id="nav-overview" onclick="showView('overview')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+          <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+        </svg> Overview
+      </div>
+      <div class="nav-item" id="nav-servers" onclick="showView('servers')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="2" width="20" height="8" rx="2"/>
+          <rect x="2" y="14" width="20" height="8" rx="2"/>
+          <line x1="6" y1="6" x2="6" y2="6"/><line x1="6" y1="18" x2="6" y2="18"/>
+        </svg> Servers
+      </div>
+    </div>
+    <div class="nav-section" style="padding-left:14px">Registered Servers</div>
+    <div class="servers-list" id="server-nav-list"></div>
+    <div class="sidebar-footer">
+      <button class="btn btn-secondary" style="width:100%;justify-content:center;font-size:12.5px"
+        onclick="openAddServer()">+ Add Server</button>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main">
+    <!-- OVERVIEW -->
+    <div id="view-overview">
+      <div class="topbar">
+        <div>
+          <div class="page-title">Overview</div>
+          <div class="page-sub">All servers at a glance</div>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn btn-secondary btn-sm" onclick="refreshAll()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg> Refresh
+          </button>
+          <button class="btn btn-primary btn-sm" onclick="openAddServer()">+ Add Server</button>
+        </div>
+      </div>
+      <div class="grid-4" id="overview-stat-cards">
+        <div class="card"><div class="card-title">Total Servers</div><div class="card-value" id="stat-total">—</div></div>
+        <div class="card"><div class="card-title">Online</div><div class="card-value" style="color:var(--success)" id="stat-online">—</div></div>
+        <div class="card"><div class="card-title">Total Models</div><div class="card-value" id="stat-models">—</div></div>
+        <div class="card"><div class="card-title">API Keys</div><div class="card-value" id="stat-keys">—</div></div>
+      </div>
+      <div id="overview-server-cards"></div>
+    </div>
+
+    <!-- SERVER DETAIL -->
+    <div id="view-server-detail" class="hidden">
+      <div class="topbar">
+        <div>
+          <div class="page-title" id="detail-server-name">Server</div>
+          <div class="page-sub" id="detail-server-host">—</div>
+        </div>
+        <div class="topbar-actions">
+          <span id="detail-status-badge"></span>
+          <button class="btn btn-secondary btn-sm" onclick="loadServerDetail(currentServerId)">↻ Refresh</button>
+          <button class="btn btn-danger btn-sm" onclick="removeServer(currentServerId)">Remove</button>
+        </div>
+      </div>
+
+      <!-- Metrics -->
+      <div class="grid-4" id="detail-metric-cards" style="margin-bottom:24px"></div>
+
+      <div class="tabs">
+        <div class="tab active" onclick="switchTab('models')">Models</div>
+        <div class="tab" onclick="switchTab('keys')">API Keys</div>
+      </div>
+
+      <!-- Models tab -->
+      <div id="tab-models">
+        <div class="section-header">
+          <div class="section-title">Installed Models</div>
+          <div style="display:flex;gap:8px">
+            <input id="pull-model-input" placeholder="model:tag  e.g. llama3:8b" style="width:220px"/>
+            <button class="btn btn-primary btn-sm" onclick="pullModel()">Pull Model</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Model</th><th>Size</th><th>Family</th><th>Modified</th><th>Actions</th>
+              </tr></thead>
+              <tbody id="models-table-body"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Keys tab -->
+      <div id="tab-keys" class="hidden">
+        <div class="section-header">
+          <div class="section-title">API Keys</div>
+          <button class="btn btn-primary btn-sm" onclick="openCreateKey()">+ New Key</button>
+        </div>
+        <div class="card">
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Key</th><th>Label</th><th>Requests</th><th>Tokens In</th><th>Tokens Out</th>
+                <th>Status</th><th>Last Used</th><th>Actions</th>
+              </tr></thead>
+              <tbody id="keys-table-body"><tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px">Loading…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SERVERS LIST VIEW -->
+    <div id="view-servers" class="hidden">
+      <div class="topbar">
+        <div><div class="page-title">Servers</div><div class="page-sub">Manage registered remote agents</div></div>
+        <button class="btn btn-primary btn-sm" onclick="openAddServer()">+ Add Server</button>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>Host</th><th>Status</th><th>Last Seen</th><th>Notes</th><th>Actions</th></tr></thead>
+            <tbody id="servers-table-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ─── MODALS ──────────────────────────────────────────────────────────────── -->
+
+<!-- Add/Edit Server -->
+<div class="modal-overlay hidden" id="modal-server">
+  <div class="modal">
+    <div class="modal-title" id="modal-server-title">Add Server</div>
+    <div class="form-group">
+      <label>Server Name</label>
+      <input id="f-srv-name" placeholder="My GPU Server"/>
+    </div>
+    <div class="form-group">
+      <label>Agent URL</label>
+      <input id="f-srv-host" placeholder="http://1.2.3.4:8080"/>
+    </div>
+    <div class="form-group">
+      <label>Admin Token</label>
+      <input id="f-srv-token" type="password" placeholder="Paste admin token from install output"/>
+    </div>
+    <div class="form-group">
+      <label>Notes (optional)</label>
+      <textarea id="f-srv-notes" rows="2" placeholder="e.g. RTX 4090 home server"></textarea>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('modal-server')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveServer()">Save Server</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Key -->
+<div class="modal-overlay hidden" id="modal-key">
+  <div class="modal">
+    <div class="modal-title">Generate API Key</div>
+    <div class="form-group">
+      <label>Label</label>
+      <input id="f-key-label" placeholder="my-application"/>
+    </div>
+    <div class="form-group">
+      <label>Rate Limit (requests/min, 0 = unlimited)</label>
+      <input id="f-key-rpm" type="number" value="0" min="0"/>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('modal-key')">Cancel</button>
+      <button class="btn btn-primary" onclick="createKey()">Generate</button>
+    </div>
+  </div>
+</div>
+
+<!-- Show new key -->
+<div class="modal-overlay hidden" id="modal-show-key">
+  <div class="modal">
+    <div class="modal-title">🎉 API Key Created</div>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:14px">
+      Copy this key now — it won't be shown again in full.
+    </p>
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;
+      font-family:monospace;font-size:13px;word-break:break-all;color:var(--accent2)" id="new-key-display"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="copyKey()">Copy Key</button>
+      <button class="btn btn-primary" onclick="closeModal('modal-show-key');loadKeys(currentServerId)">Done</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API = '';  // same origin
+let currentServerId = null;
+let editingServerId = null;
+let currentTab = 'models';
+let serverStatuses = {};
+let newKeyValue = '';
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+const $ = id => document.getElementById(id);
+const toast = (msg, type='info') => {
+  const el = $('toast');
+  el.textContent = msg;
+  el.style.borderColor = type==='error'?'var(--danger)':type==='success'?'var(--success)':'var(--border)';
+  el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'), 3200);
+};
+
+const fmt = n => n==null?'—':Number(n).toLocaleString();
+const fmtBytes = b => {
+  if(!b) return '—';
+  if(b>1e9) return (b/1e9).toFixed(1)+'GB';
+  if(b>1e6) return (b/1e6).toFixed(1)+'MB';
+  return b+'B';
+};
+const fmtDate = s => s ? new Date(s).toLocaleDateString()+' '+new Date(s).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—';
+const truncateKey = k => k ? k.slice(0,12)+'…'+k.slice(-4) : '—';
+
+async function apiFetch(path, opts={}) {
+  const r = await fetch(API+path, {
+    headers: {'Content-Type':'application/json', ...(opts.headers||{})},
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const data = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(data.detail || data.error || r.statusText);
+  return data;
+}
+
+// ── Views ────────────────────────────────────────────────────────────────────
+
+function showView(view) {
+  ['overview','server-detail','servers'].forEach(v=>{
+    $(`view-${v}`).classList.toggle('hidden', v!==view);
+  });
+  ['overview','servers'].forEach(n=>{
+    $(`nav-${n}`)?.classList.toggle('active', n===view);
+  });
+  if(view==='overview') loadOverview();
+  if(view==='servers') loadServersTable();
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tab').forEach((t,i)=>{
+    t.classList.toggle('active', ['models','keys'][i]===tab);
+  });
+  $('tab-models').classList.toggle('hidden', tab!=='models');
+  $('tab-keys').classList.toggle('hidden', tab!=='keys');
+  if(tab==='keys') loadKeys(currentServerId);
+}
+
+// ── Overview ─────────────────────────────────────────────────────────────────
+
+async function loadOverview() {
+  const servers = await apiFetch('/api/servers').catch(()=>[]);
+  $('stat-total').textContent = servers.length;
+
+  let online=0, models=0, keys=0;
+  const cards = [];
+
+  const statuses = await Promise.all(servers.map(s =>
+    apiFetch(`/api/servers/${s.id}/status`).catch(()=>({online:false,metrics:null,models:[]}))
+  ));
+
+  statuses.forEach((st,i)=>{
+    const s = servers[i];
+    serverStatuses[s.id] = st;
+    if(st.online) online++;
+    models += (st.models||[]).length;
+    cards.push(buildServerCard(s, st));
+  });
+
+  $('stat-online').textContent = online;
+  $('stat-models').textContent = models;
+
+  // Load keys count
+  Promise.all(servers.map(s=>
+    apiFetch(`/api/servers/${s.id}/keys`).catch(()=>[])
+  )).then(allKeys=>{
+    let total = 0;
+    allKeys.forEach(k=>{ total+=(Array.isArray(k)?k:Object.values(k)).length; });
+    $('stat-keys').textContent = total;
+  });
+
+  $('overview-server-cards').innerHTML = cards.length
+    ? cards.join('')
+    : `<div class="empty"><div class="empty-icon">🖥️</div><div class="empty-title">No servers yet</div>
+       <p style="font-size:13px;margin-top:4px">Click "Add Server" to register your first remote agent.</p></div>`;
+
+  buildSidebarServerList(servers, statuses);
+}
+
+function buildServerCard(s, st) {
+  const badge = st.online
+    ? `<span class="badge badge-online">● Online</span>`
+    : `<span class="badge badge-offline">● Offline</span>`;
+  const m = st.metrics || {};
+  const cpu = m.cpu_percent ?? 0;
+  const ram = m.ram ?? {};
+  const gpu = m.gpu?.gpus?.[0];
+
+  const modelsHtml = (st.models||[]).slice(0,4).map(mod=>
+    `<span class="model-pill">${mod.name}</span>`
+  ).join(' ') || '<span style="color:var(--muted);font-size:12px">No models</span>';
+
+  return `
+  <div class="card" style="margin-bottom:16px;cursor:pointer" onclick="openServerDetail(${s.id})">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">
+      <div>
+        <div style="font-size:15px;font-weight:700">${s.name}</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:3px">${s.host||'—'}</div>
+      </div>
+      ${badge}
+    </div>
+    ${st.online ? `
+    <div class="grid-4" style="gap:10px;margin-bottom:14px">
+      <div>
+        <div style="font-size:11px;color:var(--muted)">CPU</div>
+        <div style="font-size:18px;font-weight:700">${cpu.toFixed(0)}%</div>
+        <div class="progress-bar"><div class="progress-fill fill-cpu" style="width:${cpu}%"></div></div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted)">RAM</div>
+        <div style="font-size:18px;font-weight:700">${ram.percent?.toFixed(0)||0}%</div>
+        <div class="progress-bar"><div class="progress-fill fill-ram" style="width:${ram.percent||0}%"></div></div>
+      </div>
+      ${gpu ? `<div>
+        <div style="font-size:11px;color:var(--muted)">GPU</div>
+        <div style="font-size:18px;font-weight:700">${gpu.utilization_percent?.toFixed(0)||0}%</div>
+        <div class="progress-bar"><div class="progress-fill fill-gpu" style="width:${gpu.utilization_percent||0}%"></div></div>
+      </div>` : ''}
+    </div>` : ''}
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+      <span style="font-size:11px;color:var(--muted);margin-right:4px">Models:</span>
+      ${modelsHtml}
+    </div>
+  </div>`;
+}
+
+function buildSidebarServerList(servers, statuses) {
+  $('server-nav-list').innerHTML = servers.map((s,i)=>{
+    const online = statuses[i]?.online;
+    return `<div class="server-nav-item ${currentServerId===s.id?'active':''}" onclick="openServerDetail(${s.id})">
+      <div class="dot ${online?'online':'offline'}"></div>
+      <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</div>
+    </div>`;
+  }).join('') || '<div style="padding:10px 14px;font-size:12px;color:var(--muted)">No servers</div>';
+}
+
+// ── Server Detail ─────────────────────────────────────────────────────────────
+
+function openServerDetail(id) {
+  currentServerId = id;
+  showView('server-detail');
+  loadServerDetail(id);
+}
+
+async function loadServerDetail(id) {
+  const server = (await apiFetch('/api/servers').catch(()=>[])).find(s=>s.id===id);
+  if(!server) return;
+
+  $('detail-server-name').textContent = server.name;
+  $('detail-server-host').textContent = server.host||'—';
+
+  const st = await apiFetch(`/api/servers/${id}/status`).catch(()=>({online:false,metrics:null,models:[]}));
+  serverStatuses[id] = st;
+
+  $('detail-status-badge').innerHTML = st.online
+    ? `<span class="badge badge-online">● Online</span>`
+    : `<span class="badge badge-offline">● Offline</span>`;
+
+  renderMetricCards(st.metrics);
+  renderModelsTable(st.models || []);
+
+  if(currentTab==='keys') loadKeys(id);
+}
+
+function renderMetricCards(m) {
+  if(!m) { $('detail-metric-cards').innerHTML=''; return; }
+  const cpu = m.cpu_percent??0;
+  const ram = m.ram??{};
+  const disk = m.disk??{};
+  const gpu = m.gpu?.gpus?.[0];
+  const uptime = m.agent_uptime_seconds ?? 0;
+  const h = Math.floor(uptime/3600), min = Math.floor((uptime%3600)/60);
+
+  $('detail-metric-cards').innerHTML = `
+    <div class="card">
+      <div class="card-title">CPU Usage</div>
+      <div class="card-value">${cpu.toFixed(1)}%</div>
+      <div class="progress-bar" style="margin-top:10px"><div class="progress-fill fill-cpu" style="width:${cpu}%"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">RAM</div>
+      <div class="card-value">${ram.percent?.toFixed(1)||0}%</div>
+      <div class="card-sub">${ram.used_gb?.toFixed(1)||0} / ${ram.total_gb?.toFixed(1)||0} GB</div>
+      <div class="progress-bar" style="margin-top:8px"><div class="progress-fill fill-ram" style="width:${ram.percent||0}%"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Disk</div>
+      <div class="card-value">${disk.percent?.toFixed(1)||0}%</div>
+      <div class="card-sub">${disk.used_gb?.toFixed(1)||0} / ${disk.total_gb?.toFixed(1)||0} GB</div>
+      <div class="progress-bar" style="margin-top:8px"><div class="progress-fill fill-disk" style="width:${disk.percent||0}%"></div></div>
+    </div>
+    ${gpu ? `<div class="card">
+      <div class="card-title">GPU · ${gpu.name||'GPU'}</div>
+      <div class="card-value">${gpu.utilization_percent?.toFixed(0)||0}%</div>
+      <div class="card-sub">${gpu.memory_used_mb?.toFixed(0)||0} / ${gpu.memory_total_mb?.toFixed(0)||0} MB VRAM · ${gpu.temperature_c||'—'}°C</div>
+      <div class="progress-bar" style="margin-top:8px"><div class="progress-fill fill-gpu" style="width:${gpu.utilization_percent||0}%"></div></div>
+    </div>` : `<div class="card">
+      <div class="card-title">Uptime</div>
+      <div class="card-value">${h}h ${min}m</div>
+      <div class="card-sub">Agent running</div>
+    </div>`}
+  `;
+}
+
+function renderModelsTable(models) {
+  if(!models.length) {
+    $('models-table-body').innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:32px">
+      No models installed. Pull one above ↑</td></tr>`;
+    return;
+  }
+  $('models-table-body').innerHTML = models.map(m => {
+    const size = fmtBytes(m.size);
+    const family = m.details?.family || '—';
+    const modified = m.modified_at ? fmtDate(m.modified_at) : '—';
+    return `<tr>
+      <td><span class="mono">${m.name}</span></td>
+      <td>${size}</td>
+      <td>${family}</td>
+      <td style="color:var(--muted);font-size:12px">${modified}</td>
+      <td>
+        <button class="btn btn-danger btn-sm" onclick="deleteModel('${m.name}')">Delete</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function pullModel() {
+  const name = $('pull-model-input').value.trim();
+  if(!name) { toast('Enter a model name', 'error'); return; }
+  toast(`Pulling ${name}… this may take minutes`, 'info');
+  try {
+    await apiFetch(`/api/servers/${currentServerId}/models/pull`, {method:'POST', body:{name}});
+    toast(`Pull started for ${name}. Refresh in a minute.`, 'success');
+    $('pull-model-input').value = '';
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function deleteModel(name) {
+  if(!confirm(`Delete model "${name}"?`)) return;
+  try {
+    await apiFetch(`/api/servers/${currentServerId}/models`, {
+      method:'DELETE', body:{name}
+    });
+    toast(`Deleted ${name}`, 'success');
+    loadServerDetail(currentServerId);
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// ── Keys ─────────────────────────────────────────────────────────────────────
+
+async function loadKeys(id) {
+  $('keys-table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:24px">Loading…</td></tr>';
+  try {
+    const keys = await apiFetch(`/api/servers/${id}/keys`);
+    const arr = Array.isArray(keys) ? keys : [];
+    if(!arr.length) {
+      $('keys-table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:32px">No API keys yet. Create one above ↑</td></tr>';
+      return;
+    }
+    $('keys-table-body').innerHTML = arr.map(k => `<tr>
+      <td><span class="mono">${truncateKey(k.key)}</span>
+        <button class="btn-icon btn-sm" style="margin-left:6px" title="Copy" onclick="navigator.clipboard.writeText('${k.key}');toast('Copied!','success')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+        </button>
+      </td>
+      <td>${k.label||'—'}</td>
+      <td>${fmt(k.requests)}</td>
+      <td>${fmt(k.tokens_in)}</td>
+      <td>${fmt(k.tokens_out)}</td>
+      <td><span class="badge ${k.enabled?'badge-online':'badge-offline'}">${k.enabled?'Active':'Disabled'}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${k.last_used?fmtDate(k.last_used):'Never'}</td>
+      <td style="display:flex;gap:6px">
+        ${k.enabled?`<button class="btn btn-secondary btn-sm" onclick="revokeKey('${k.key}')">Revoke</button>`:''}
+        <button class="btn btn-danger btn-sm" onclick="deleteKey('${k.key}')">Delete</button>
+      </td>
+    </tr>`).join('');
+  } catch(e) { toast(e.message,'error'); }
+}
+
+function openCreateKey() { $('f-key-label').value=''; $('f-key-rpm').value='0'; $('modal-key').classList.remove('hidden'); }
+
+async function createKey() {
+  const label = $('f-key-label').value.trim();
+  const limit_rpm = parseInt($('f-key-rpm').value)||0;
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/keys`, {method:'POST',body:{label,limit_rpm}});
+    closeModal('modal-key');
+    newKeyValue = data.key;
+    $('new-key-display').textContent = data.key;
+    $('modal-show-key').classList.remove('hidden');
+    toast('API key created!','success');
+  } catch(e) { toast(e.message,'error'); }
+}
+
+async function revokeKey(key) {
+  if(!confirm('Revoke this key? It will stop working immediately.')) return;
+  try {
+    await apiFetch(`/api/servers/${currentServerId}/keys/revoke`, {method:'POST',body:{key}});
+    toast('Key revoked','success');
+    loadKeys(currentServerId);
+  } catch(e) { toast(e.message,'error'); }
+}
+
+async function deleteKey(key) {
+  if(!confirm('Permanently delete this key?')) return;
+  try {
+    await apiFetch(`/api/servers/${currentServerId}/keys`, {method:'DELETE',body:{key}});
+    toast('Key deleted','success');
+    loadKeys(currentServerId);
+  } catch(e) { toast(e.message,'error'); }
+}
+
+function copyKey() { navigator.clipboard.writeText(newKeyValue); toast('Key copied!','success'); }
+
+// ── Servers management ────────────────────────────────────────────────────────
+
+async function loadServersTable() {
+  const servers = await apiFetch('/api/servers').catch(()=>[]);
+  if(!servers.length) {
+    $('servers-table-body').innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:32px">No servers registered yet.</td></tr>';
+    return;
+  }
+  $('servers-table-body').innerHTML = servers.map(s=>`<tr>
+    <td><strong>${s.name}</strong></td>
+    <td><span class="mono">${s.host}</span></td>
+    <td id="srv-status-${s.id}"><span class="badge badge-warn">Checking…</span></td>
+    <td style="font-size:12px;color:var(--muted)">${s.last_seen?fmtDate(s.last_seen):'Never'}</td>
+    <td style="font-size:12px;color:var(--muted)">${s.notes||'—'}</td>
+    <td style="display:flex;gap:6px">
+      <button class="btn btn-secondary btn-sm" onclick="openServerDetail(${s.id})">Open</button>
+      <button class="btn btn-secondary btn-sm" onclick="openEditServer(${s.id})">Edit</button>
+      <button class="btn btn-danger btn-sm" onclick="removeServer(${s.id})">Remove</button>
+    </td>
+  </tr>`).join('');
+
+  // Check status async
+  servers.forEach(s=>{
+    apiFetch(`/api/servers/${s.id}/status`).then(st=>{
+      const el = $(`srv-status-${s.id}`);
+      if(el) el.innerHTML = st.online
+        ? `<span class="badge badge-online">● Online</span>`
+        : `<span class="badge badge-offline">● Offline</span>`;
+    }).catch(()=>{
+      const el = $(`srv-status-${s.id}`);
+      if(el) el.innerHTML = `<span class="badge badge-offline">● Offline</span>`;
+    });
+  });
+}
+
+function openAddServer() {
+  editingServerId = null;
+  $('modal-server-title').textContent = 'Add Server';
+  ['f-srv-name','f-srv-host','f-srv-token','f-srv-notes'].forEach(id=>$(id).value='');
+  $('modal-server').classList.remove('hidden');
+}
+
+async function openEditServer(id) {
+  const servers = await apiFetch('/api/servers').catch(()=>[]);
+  const s = servers.find(sv=>sv.id===id);
+  if(!s) return;
+  editingServerId = id;
+  $('modal-server-title').textContent = 'Edit Server';
+  $('f-srv-name').value = s.name;
+  $('f-srv-host').value = s.host;
+  $('f-srv-token').value = '';  // token is hidden; user must re-enter to change
+  $('f-srv-notes').value = s.notes||'';
+  $('modal-server').classList.remove('hidden');
+}
+
+async function saveServer() {
+  const name = $('f-srv-name').value.trim();
+  const host = $('f-srv-host').value.trim();
+  const token = $('f-srv-token').value.trim();
+  const notes = $('f-srv-notes').value.trim();
+  if(!name||!host||!token) { toast('Name, Host, and Admin Token are required','error'); return; }
+  try {
+    if(editingServerId) {
+      await apiFetch(`/api/servers/${editingServerId}`, {method:'PUT',body:{name,host,admin_token:token,notes}});
+      toast('Server updated','success');
+    } else {
+      await apiFetch('/api/servers', {method:'POST',body:{name,host,admin_token:token,notes}});
+      toast('Server added','success');
+    }
+    closeModal('modal-server');
+    loadOverview();
+  } catch(e) { toast(e.message,'error'); }
+}
+
+async function removeServer(id) {
+  if(!confirm('Remove this server from the dashboard? (The remote agent keeps running.)')) return;
+  try {
+    await apiFetch(`/api/servers/${id}`, {method:'DELETE'});
+    toast('Server removed','success');
+    if(currentServerId===id) showView('overview');
+    else loadOverview();
+  } catch(e) { toast(e.message,'error'); }
+}
+
+// ── Modals ────────────────────────────────────────────────────────────────────
+function closeModal(id) { $(id).classList.add('hidden'); }
+
+document.addEventListener('keydown', e=>{
+  if(e.key==='Escape') document.querySelectorAll('.modal-overlay').forEach(m=>m.classList.add('hidden'));
+});
+
+// ── Refresh ────────────────────────────────────────────────────────────────
+async function refreshAll() {
+  if($('view-overview').classList.contains('hidden')===false) loadOverview();
+  else if(currentServerId) loadServerDetail(currentServerId);
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+loadOverview();
+// Auto-refresh every 30s
+setInterval(()=>{
+  if(!$('view-overview').classList.contains('hidden')) loadOverview();
+  else if(currentServerId && !$('view-server-detail').classList.contains('hidden')) loadServerDetail(currentServerId);
+}, 30000);
+</script>
+</body>
+</html>

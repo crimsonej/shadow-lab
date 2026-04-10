@@ -1,0 +1,21 @@
+# ==========================================
+# Shadow-Lab AI Provider Agent Requirements
+# Created by crimsonej - https://github.com/crimsonej/crimsonej
+# ==========================================
+# 
+# INSTRUCTIONS:
+# To install these requirements within a virtual environment, run:
+# 
+#    python3 -m venv .venv
+#    source .venv/bin/activate
+#    pip install -r requirements.txt
+#
+# ==========================================
+
+fastapi
+uvicorn
+httpx
+psutil
+pydantic
+pydantic-settings
+python-dotenv
