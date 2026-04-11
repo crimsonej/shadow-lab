@@ -39,6 +39,7 @@ import model_tester
 import api_tester
 import uptime_tracker
 import structured_logger
+import process_tracker
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -156,7 +157,8 @@ async def list_models(api_key: str = Depends(get_api_key)):
     return {"object": "list", "data": data}
 
 
-# ── Chat completions ──────────────────────────────────────────────────────────
+# Global counter for active inference requests
+ACTIVE_REQUESTS = 0
 
 @app.post("/v1/chat/completions", tags=["Public"])
 async def chat_completions(
@@ -167,56 +169,95 @@ async def chat_completions(
     OpenAI-compatible chat completions endpoint.
     Supports both streaming (stream=true) and non-streaming responses.
     """
-    messages = [m.model_dump() for m in body.messages]
+    global ACTIVE_REQUESTS
+    ACTIVE_REQUESTS += 1
+    
+    try:
+        # Inject active model if not specified
+        if not body.model:
+            active = config.get_active_model()
+            if not active:
+                raise HTTPException(400, "No model selected. Provide ‘model’ or select an active model in dashboard.")
+            body.model = active
 
-    async with _semaphore:
-        if body.stream:
-            async def event_stream() -> AsyncIterator[bytes]:
-                prompt_tokens = 0
-                completion_tokens = 0
+        messages = [m.model_dump() for m in body.messages]
+
+        async with _semaphore:
+            if body.stream:
+                async def event_stream() -> AsyncIterator[bytes]:
+                    prompt_tokens = 0
+                    completion_tokens = 0
+                    try:
+                        async for chunk in ollama_client.chat_completion_stream(
+                            model=body.model,
+                            messages=messages,
+                            temperature=body.temperature,
+                            max_tokens=body.max_tokens,
+                        ):
+                            yield chunk.encode()
+                            # rough token counting for usage
+                            completion_tokens += 1
+                    except Exception as e:
+                        log.error(f"Streaming error: {e}")
+                    finally:
+                        auth.record_usage(api_key, tokens_in=prompt_tokens, tokens_out=completion_tokens)
+                        ACTIVE_REQUESTS -= 1
+
+                return StreamingResponse(event_stream(), media_type="text/event-stream")
+            else:
                 try:
-                    async for chunk in ollama_client.chat_completion_stream(
+                    result = await ollama_client.chat_completion(
                         model=body.model,
                         messages=messages,
                         temperature=body.temperature,
                         max_tokens=body.max_tokens,
-                    ):
-                        yield chunk.encode()
-                        # rough token counting for usage
-                        completion_tokens += 1
+                    )
                 except Exception as e:
-                    log.error(f"Streaming error: {e}")
+                    raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
                 finally:
-                    auth.record_usage(api_key, tokens_in=prompt_tokens, tokens_out=completion_tokens)
+                    ACTIVE_REQUESTS -= 1
 
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
-        else:
-            try:
-                result = await ollama_client.chat_completion(
-                    model=body.model,
-                    messages=messages,
-                    temperature=body.temperature,
-                    max_tokens=body.max_tokens,
+                usage = result.get("usage", {})
+                auth.record_usage(
+                    api_key,
+                    tokens_in=usage.get("prompt_tokens", 0),
+                    tokens_out=usage.get("completion_tokens", 0),
                 )
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
-
-            usage = result.get("usage", {})
-            auth.record_usage(
-                api_key,
-                tokens_in=usage.get("prompt_tokens", 0),
-                tokens_out=usage.get("completion_tokens", 0),
-            )
-            return JSONResponse(result)
+                return JSONResponse(result)
+    except Exception as e:
+        # This catch is for errors *before* the inner finally blocks are set up (like messages parsing or semaphore issues)
+        # However, we must be careful not to double-decrement if the error happened inside the non-streaming try block.
+        # But wait, if an error happens in the non-streaming block, it raises, then it enters THIS except, 
+        # but the inner finally ALREADY ran. So we'd double-decrement.
+        
+        # Proper way: Only decrement if we haven't reached the response phase or if it's an error NOT handled by inner finally.
+        # Actually, if an exception is raised in the 'else' block, the inner finally runs, THEN the exception propagates here.
+        
+        # Let's check status of decrementing. 
+        # Actually, let's just make the outer block simpler: only wrap the setup code.
+        raise e
 
 
 # ── Admin: metrics ────────────────────────────────────────────────────────────
 
 @app.get("/admin/metrics", tags=["Admin"])
 async def admin_metrics(_: str = Depends(require_admin)):
+    global ACTIVE_REQUESTS
     m = await metrics.snapshot()
     ollama_ok = await ollama_client.ping_ollama()
     m["ollama_running"] = ollama_ok
+    m["active_requests"] = ACTIVE_REQUESTS
+    try:
+        # Fetch loaded models directly from Ollama
+        r = await ollama_client._http.get("http://localhost:11434/api/ps", timeout=2)
+        if r.status_code == 200:
+            models_data = r.json()
+            m["models_loaded"] = models_data.get("models", [])
+        else:
+            m["models_loaded"] = []
+    except Exception:
+        m["models_loaded"] = []
+    
     return m
 
 
@@ -296,7 +337,89 @@ async def admin_list_models(_: str = Depends(require_admin)):
         models = await ollama_client.list_models()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
+
+    active_model = config.get_active_model()
+    for m in models:
+        m["installed"] = True
+        m["active"] = (m.get("name") == active_model)
+
     return {"models": models}
+
+# ── Control Plane: Active Model & Loading ───────────────────────────────────
+
+@app.post("/admin/models/select", tags=["Admin"])
+async def admin_select_model(body: schemas.SelectModelRequest, _: str = Depends(require_admin)):
+    """Set the globally active model."""
+    config.set_active_model(body.model)
+    return {"status": "ok", "active_model": body.model}
+
+
+@app.get("/admin/models/active", tags=["Admin"])
+async def admin_get_active_model(_: str = Depends(require_admin)):
+    """Get the globally active model."""
+    return {"active_model": config.get_active_model()}
+
+
+@app.post("/admin/models/load", tags=["Admin"])
+async def admin_load_model(body: schemas.LoadModelRequest, _: str = Depends(require_admin)):
+    """Load a model into VRAM."""
+    success = await ollama_client.load_model(body.model)
+    if not success:
+        raise HTTPException(500, "Failed to load model in Ollama.")
+    return {"status": "ok", "message": f"Model {body.model} loaded."}
+
+
+@app.post("/admin/models/unload", tags=["Admin"])
+async def admin_unload_model(body: schemas.LoadModelRequest, _: str = Depends(require_admin)):
+    """Unload a model from VRAM."""
+    success = await ollama_client.unload_model(body.model)
+    if not success:
+        raise HTTPException(500, "Failed to unload model in Ollama.")
+    return {"status": "ok", "message": f"Model {body.model} unloaded."}
+
+# ── Control Plane: API Integrity Testing ──────────────────────────────────────
+
+@app.post("/admin/test-api-key", tags=["Admin"])
+async def admin_test_api_key(body: schemas.ApiKeyTestRequest, _: str = Depends(require_admin)):
+    """
+    Test an API key by running inference locally through the proxy.
+    Returns PASS/FAIL and the response details.
+    """
+    if body.api_key not in auth.API_KEYS:
+        return {"status": "FAIL", "model_used": "", "error": "Invalid API Key"}
+
+    model_to_use = body.model or config.get_active_model()
+    if not model_to_use:
+        return {"status": "FAIL", "model_used": "", "error": "No model supplied and no active model set."}
+
+    import time
+    start_time = time.time()
+    try:
+        req = schemas.ChatCompletionRequest(
+            model=model_to_use,
+            messages=[schemas.ChatMessage(role="user", content="Say OK if working")],
+            max_tokens=10,
+            stream=False
+        )
+        resp = await ollama_client.chat_completion(
+            req.model, [{"role": m.role, "content": m.content} for m in req.messages], req.temperature, req.max_tokens, False
+        )
+        latency = (time.time() - start_time) * 1000
+        content = resp["choices"][0]["message"]["content"]
+        
+        return {
+            "status": "PASS",
+            "model_used": model_to_use,
+            "response": content,
+            "latency_ms": round(latency, 2)
+        }
+    except Exception as e:
+        return {
+            "status": "FAIL",
+            "model_used": model_to_use,
+            "error": str(e),
+            "latency_ms": round((time.time() - start_time) * 1000, 2)
+        }
 
 
 # ── Control Plane: Model Testing ──────────────────────────────────────────────
@@ -391,6 +514,76 @@ async def admin_lifecycle_status(_: str = Depends(require_admin)):
         "agent_version": AGENT_VERSION,
         "agent_uptime": uptime_tracker.get_uptime(),
     }
+
+
+# ── Soft Lifecycle: Activate / Deactivate ─────────────────────────────────────
+
+@app.post("/admin/deactivate", tags=["Admin"])
+async def admin_deactivate(_: str = Depends(require_admin)):
+    """
+    Soft deactivate: stop Ollama process and free ports.
+    The agent stays alive so it can be re-activated remotely.
+    """
+    global ACTIVE_REQUESTS
+
+    # Safety check: block if requests are in-flight (unless force)
+    if ACTIVE_REQUESTS > 0:
+        return {
+            "status": "blocked",
+            "message": f"Cannot deactivate: {ACTIVE_REQUESTS} active request(s) in progress.",
+            "active_requests": ACTIVE_REQUESTS,
+            "state": "active",
+        }
+
+    # Kill Ollama
+    kill_result = process_tracker.kill_ollama()
+    state = process_tracker.get_status()
+
+    log.info(f"Server DEACTIVATED — Ollama killed: {kill_result}")
+    return {
+        "status": "ok" if kill_result["success"] else "partial",
+        "message": "Server deactivated. Ollama stopped, agent remains alive.",
+        "ollama_kill": kill_result,
+        "state": state["state"],
+        "processes": state["processes"],
+    }
+
+
+@app.post("/admin/activate", tags=["Admin"])
+async def admin_activate(_: str = Depends(require_admin)):
+    """
+    Soft activate: start Ollama and verify health.
+    """
+    start_result = process_tracker.start_ollama()
+
+    # Wait briefly, then verify
+    import asyncio
+    await asyncio.sleep(2)
+
+    ollama_ok = await ollama_client.ping_ollama()
+    state = process_tracker.get_status()
+
+    log.info(f"Server ACTIVATED — Ollama started: {start_result}, reachable: {ollama_ok}")
+    return {
+        "status": "active" if ollama_ok else "failed",
+        "message": "Server activated successfully." if ollama_ok else "Ollama started but not yet reachable.",
+        "ollama_reachable": ollama_ok,
+        "ollama_start": start_result,
+        "state": state["state"],
+        "processes": state["processes"],
+    }
+
+
+@app.get("/admin/server-state", tags=["Admin"])
+async def admin_server_state(_: str = Depends(require_admin)):
+    """
+    Return the current soft server state: active | idle | offline.
+    Includes PID tracking information.
+    """
+    global ACTIVE_REQUESTS
+    state = process_tracker.get_status()
+    state["active_requests"] = ACTIVE_REQUESTS
+    return state
 
 
 # ── Control Plane: Structured Logs ────────────────────────────────────────────

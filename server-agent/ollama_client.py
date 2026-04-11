@@ -27,10 +27,50 @@ def get_client() -> httpx.AsyncClient:
 # ── Model management ──────────────────────────────────────────────────────────
 
 async def list_models() -> List[Dict[str, Any]]:
-    """Return list of locally available models."""
-    r = await get_client().get("/api/tags")
-    r.raise_for_status()
-    return r.json().get("models", [])
+    """Return list of locally available models, enriched with active/loaded state."""
+    # Note: caller will resolve 'active' label, we just supply 'loaded' here
+    try:
+        r = await get_client().get("/api/tags")
+        r.raise_for_status()
+        base_models = r.json().get("models", [])
+    except Exception:
+        return []
+
+    # Get loaded models from /api/ps
+    try:
+        rps = await get_client().get("/api/ps")
+        rps.raise_for_status()
+        loaded_names = {m.get("name") for m in rps.json().get("models", [])}
+    except Exception:
+        loaded_names = set()
+
+    for m in base_models:
+        m["loaded"] = m.get("name") in loaded_names
+
+    return base_models
+
+async def load_model(name: str) -> bool:
+    """Pre-load a model into VRAM by hitting /api/generate with an empty prompt."""
+    try:
+        r = await get_client().post("/api/generate", json={
+            "model": name,
+            "keep_alive": -1  # Load and keep indefinitely until unloaded
+        })
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def unload_model(name: str) -> bool:
+    """Unload a model from VRAM."""
+    try:
+        r = await get_client().post("/api/generate", json={
+            "model": name,
+            "keep_alive": 0
+        })
+        return r.status_code == 200
+    except Exception:
+        return False
 
 
 async def pull_model(name: str) -> AsyncIterator[str]:

@@ -13,7 +13,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     messages: List[ChatMessage]
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1)
@@ -93,3 +93,26 @@ class LifecycleActionRequest(BaseModel):
 
 class LogQueryParams(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
+
+
+# ── Active Model Management ───────────────────────────────────────────────────
+
+class SelectModelRequest(BaseModel):
+    model: str
+
+
+class LoadModelRequest(BaseModel):
+    model: str
+
+
+class ApiKeyTestRequest(BaseModel):
+    api_key: str
+    model: Optional[str] = None
+
+
+class ApiKeyTestResponse(BaseModel):
+    status: str
+    model_used: str
+    response: Optional[str] = None
+    latency_ms: float = 0
+    error: Optional[str] = None

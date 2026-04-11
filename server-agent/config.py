@@ -60,3 +60,24 @@ def ensure_admin_token() -> str:
         print(f"  {ADMIN_TOKEN}")
         print(f"{'='*60}\n")
     return ADMIN_TOKEN
+
+
+# ── Active Model State Persistence ────────────────────────────────────────────
+
+ACTIVE_MODEL_FILE = DATA_DIR / "active_model.txt"
+
+def get_active_model() -> str:
+    """Read the currently active model from disk, or empty string if none."""
+    if ACTIVE_MODEL_FILE.exists():
+        try:
+            return ACTIVE_MODEL_FILE.read_text().strip()
+        except IOError:
+            pass
+    return ""
+
+def set_active_model(model: str):
+    """Save the active model to disk."""
+    try:
+        ACTIVE_MODEL_FILE.write_text(model)
+    except IOError:
+        pass

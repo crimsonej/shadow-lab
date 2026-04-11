@@ -19,6 +19,7 @@ import threading
 import db
 import deploy
 import server_lifecycle
+import system_control
 import compatibility
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -144,11 +145,17 @@ if USE_FASTAPI:
         metrics_code, metrics_data = await _proxy_get(server["host"], server["admin_token"], "/admin/metrics")
         models_code, models_data = await _proxy_get(server["host"], server["admin_token"], "/admin/models")
 
+        state = "offline"
         if status_code == 200:
             db.update_server_seen(server_id)
+            if metrics_data and not metrics_data.get("ollama_running"):
+                state = "idle"
+            else:
+                state = "online"
 
         return {
             "online": status_code == 200,
+            "state": state,
             "health": health if status_code == 200 else None,
             "metrics": metrics_data if metrics_code == 200 else None,
             "models": models_data.get("models", []) if models_code == 200 else [],
@@ -188,6 +195,28 @@ if USE_FASTAPI:
         if not server:
             raise HTTPException(404, "Server not found")
         code, data = await _proxy_delete(server["host"], server["admin_token"], "/admin/models", {"name": body.name})
+        if code != 200:
+            raise HTTPException(code, data.get("error", "Failed"))
+        return data
+
+    @app.post("/api/servers/{server_id}/models/{action}")
+    async def api_model_actions(server_id: int, action: str, body: dict):
+        if action not in ["select", "load", "unload"]:
+            raise HTTPException(400, "Invalid action")
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_post(server["host"], server["admin_token"], f"/admin/models/{action}", body)
+        if code != 200:
+            raise HTTPException(code, data.get("error", "Failed"))
+        return data
+
+    @app.post("/api/servers/{server_id}/keys/test")
+    async def api_test_api_key(server_id: int, body: dict):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_post(server["host"], server["admin_token"], "/admin/test-api-key", body)
         if code != 200:
             raise HTTPException(code, data.get("error", "Failed"))
         return data
@@ -345,6 +374,26 @@ if USE_FASTAPI:
             result = await server_lifecycle.stop_agent(server)
         elif action == "start-agent":
             result = await server_lifecycle.start_agent(server)
+        elif action == "start-ai":
+            result = await system_control.start_ai(server)
+        elif action == "stop-ai":
+            result = await system_control.stop_ai(server)
+        elif action == "restart-ai":
+            result = await system_control.restart_ai(server)
+        elif action == "shutdown":
+            # Optional force parameter check via query string if we want, but we'll accept it from json body
+            # Wait, api_lifecycle is a POST, we could extract force flag. 
+            # We'll default to forced here or assume the UI handles confirmation. 
+            # To be safe, we'll pass force=True since the UI will have a giant warning modal.
+            result = await system_control.shutdown_machine(server, force=True)
+        elif action == "reboot":
+            result = await system_control.reboot_machine(server, force=True)
+        elif action == "idle":
+            result = await system_control.sleep_mode(server)
+        elif action == "deactivate":
+            result = await system_control.deactivate_server(server, force=True)
+        elif action == "activate":
+            result = await system_control.activate_server(server)
         elif action == "health":
             result = await server_lifecycle.check_server_health(server)
         else:
@@ -471,11 +520,17 @@ else:
         metrics_code, metrics_data = _proxy_get(server["host"], server["admin_token"], "/admin/metrics")
         models_code, models_data = _proxy_get(server["host"], server["admin_token"], "/admin/models")
 
+        state = "offline"
         if status_code == 200:
             db.update_server_seen(server_id)
+            if metrics_data and not metrics_data.get("ollama_running"):
+                state = "idle"
+            else:
+                state = "online"
 
         return jsonify({
             "online": status_code == 200,
+            "state": state,
             "health": health if status_code == 200 else None,
             "metrics": metrics_data if metrics_code == 200 else None,
             "models": models_data.get("models", []) if models_code == 200 else [],
@@ -512,6 +567,30 @@ else:
         
         body = request.get_json()
         code, data = _proxy_delete(server["host"], server["admin_token"], "/admin/models", {"name": body.get("name")})
+        if code != 200:
+            return jsonify({"detail": data.get("error", "Failed")}), code
+        return jsonify(data)
+
+    @app.route("/api/servers/<int:server_id>/models/<action>", methods=["POST"])
+    def api_model_actions(server_id, action):
+        if action not in ["select", "load", "unload"]:
+            return jsonify({"detail": "Invalid action"}), 400
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        body = request.json or {}
+        code, data = _proxy_post(server["host"], server["admin_token"], f"/admin/models/{action}", body)
+        if code != 200:
+            return jsonify({"detail": data.get("error", "Failed")}), code
+        return jsonify(data)
+
+    @app.route("/api/servers/<int:server_id>/keys/test", methods=["POST"])
+    def api_test_api_key(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        body = request.json or {}
+        code, data = _proxy_post(server["host"], server["admin_token"], "/admin/test-api-key", body)
         if code != 200:
             return jsonify({"detail": data.get("error", "Failed")}), code
         return jsonify(data)
@@ -670,6 +749,22 @@ else:
                 result = loop.run_until_complete(server_lifecycle.stop_agent(server))
             elif action == "start-agent":
                 result = loop.run_until_complete(server_lifecycle.start_agent(server))
+            elif action == "start-ai":
+                result = loop.run_until_complete(system_control.start_ai(server))
+            elif action == "stop-ai":
+                result = loop.run_until_complete(system_control.stop_ai(server))
+            elif action == "restart-ai":
+                result = loop.run_until_complete(system_control.restart_ai(server))
+            elif action == "shutdown":
+                result = loop.run_until_complete(system_control.shutdown_machine(server, force=True))
+            elif action == "reboot":
+                result = loop.run_until_complete(system_control.reboot_machine(server, force=True))
+            elif action == "idle":
+                result = loop.run_until_complete(system_control.sleep_mode(server))
+            elif action == "deactivate":
+                result = loop.run_until_complete(system_control.deactivate_server(server, force=True))
+            elif action == "activate":
+                result = loop.run_until_complete(system_control.activate_server(server))
             elif action == "health":
                 result = loop.run_until_complete(server_lifecycle.check_server_health(server))
             else:
@@ -710,8 +805,8 @@ else:
 
 
 if __name__ == "__main__":
-    print(f"\n  Shadow-Lab Control Plane running at: http://localhost:{DASHBOARD_PORT}\n")
+    print(f"\n  Shadow-Lab Control Plane running at: http://0.0.0.0:{DASHBOARD_PORT}\n")
     if USE_FASTAPI:
-        uvicorn.run("main:app", host="127.0.0.1", port=DASHBOARD_PORT, reload=False, log_level="warning")
+        uvicorn.run("main:app", host="0.0.0.0", port=DASHBOARD_PORT, reload=False, log_level="warning")
     else:
-        app.run(host="127.0.0.1", port=DASHBOARD_PORT, debug=False)
+        app.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=False)
