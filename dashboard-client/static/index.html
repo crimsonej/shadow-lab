@@ -305,27 +305,86 @@
 
 <!-- Add/Edit Server -->
 <div class="modal-overlay hidden" id="modal-server">
-  <div class="modal">
+  <div class="modal" style="width: 520px;">
     <div class="modal-title" id="modal-server-title">Add Server</div>
-    <div class="form-group">
-      <label>Server Name</label>
-      <input id="f-srv-name" placeholder="My GPU Server"/>
+    
+    <div class="tabs" style="margin-bottom: 20px;">
+      <div class="tab active" id="tab-mode-api" onclick="setAddMode('api')">API Mode</div>
+      <div class="tab" id="tab-mode-ssh" onclick="setAddMode('ssh')">SSH Auto-Deploy</div>
     </div>
-    <div class="form-group">
-      <label>Agent URL</label>
-      <input id="f-srv-host" placeholder="http://1.2.3.4:8080"/>
+
+    <!-- API MODE FIELDS -->
+    <div id="fields-api">
+      <div class="form-group">
+        <label>Server Name</label>
+        <input id="f-srv-name" placeholder="My GPU Server"/>
+      </div>
+      <div class="form-group">
+        <label>Agent URL</label>
+        <input id="f-srv-host" placeholder="http://1.2.3.4:8080"/>
+      </div>
+      <div class="form-group">
+        <label>Admin Token</label>
+        <input id="f-srv-token" type="password" placeholder="Paste admin token from install output"/>
+      </div>
     </div>
-    <div class="form-group">
-      <label>Admin Token</label>
-      <input id="f-srv-token" type="password" placeholder="Paste admin token from install output"/>
+
+    <!-- SSH MODE FIELDS -->
+    <div id="fields-ssh" class="hidden">
+      <div class="form-group">
+        <label>Server Name</label>
+        <input id="f-ssh-name" placeholder="My Cloud GPU"/>
+      </div>
+      <div class="form-group">
+        <label>Remote IP / Hostname</label>
+        <input id="f-ssh-host" placeholder="1.2.3.4"/>
+      </div>
+      <div class="grid-2" style="margin-bottom: 0;">
+        <div class="form-group">
+          <label>SSH Username</label>
+          <input id="f-ssh-user" placeholder="root"/>
+        </div>
+        <div class="form-group">
+          <label>SSH Port</label>
+          <input id="f-ssh-port" type="number" value="22" min="1" max="65535"/>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>SSH Password</label>
+        <input id="f-ssh-pass" type="password" placeholder="Password"/>
+      </div>
+      <div style="padding:10px 14px;background:rgba(108,99,255,.08);border:1px solid rgba(108,99,255,.2);border-radius:8px;font-size:12px;color:var(--muted);margin-bottom:4px;line-height:1.6">
+        <strong style="color:var(--accent)">⚡ Auto-Deploy</strong> will connect via SSH and automatically:<br>
+        ✦ Install Python, pip, and Ollama<br>
+        ✦ Upload and configure the AI agent<br>
+        ✦ Generate a secure admin token<br>
+        ✦ Start the agent in the background
+      </div>
     </div>
+
     <div class="form-group">
       <label>Notes (optional)</label>
       <textarea id="f-srv-notes" rows="2" placeholder="e.g. RTX 4090 home server"></textarea>
     </div>
+
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal('modal-server')">Cancel</button>
-      <button class="btn btn-primary" onclick="saveServer()">Save Server</button>
+      <button class="btn btn-primary" id="btn-save-server" onclick="saveServer()">Save Server</button>
+    </div>
+  </div>
+</div>
+
+<!-- Deployment Progress -->
+<div class="modal-overlay hidden" id="modal-deploy">
+  <div class="modal" style="width: 640px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+      <div id="deploy-spinner" class="spin"></div>
+      <div class="modal-title" style="margin-bottom:0" id="deploy-modal-title">Deploying Agent...</div>
+    </div>
+    <div id="deploy-terminal" style="background:#0a0a0a;color:#33ff33;font-family:'Courier New',monospace;font-size:11.5px;padding:16px;border-radius:8px;height:320px;overflow-y:auto;white-space:pre-wrap;line-height:1.55;border:1px solid #1a1a2e;margin-bottom:12px"></div>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div id="deploy-status-text" style="font-size:13px;color:var(--muted)">Connecting...</div>
+      <button class="btn btn-secondary hidden" id="btn-deploy-close" onclick="closeModal('modal-deploy')">Close</button>
     </div>
   </div>
 </div>
@@ -372,8 +431,89 @@ const API = '';  // same origin
 let currentServerId = null;
 let editingServerId = null;
 let currentTab = 'models';
+let addMode = 'api';
 let serverStatuses = {};
 let newKeyValue = '';
+let deployInterval = null;
+
+function setAddMode(mode) {
+  addMode = mode;
+  $('tab-mode-api').classList.toggle('active', mode === 'api');
+  $('tab-mode-ssh').classList.toggle('active', mode === 'ssh');
+  $('fields-api').classList.toggle('hidden', mode !== 'api');
+  $('fields-ssh').classList.toggle('hidden', mode !== 'ssh');
+  $('btn-save-server').textContent = mode === 'api' ? 'Save Server' : 'Start Deployment';
+}
+
+function startDeployment() {
+  const host = $('f-ssh-host').value.trim();
+  const user = $('f-ssh-user').value.trim();
+  const port = $('f-ssh-port').value.trim() || '22';
+  const pass = $('f-ssh-pass').value;
+  const notes = $('f-srv-notes').value.trim();
+  const name = $('f-ssh-name').value.trim() || host;
+
+  if (!host || !user) { toast('IP and Username are required', 'error'); return; }
+  if (!pass) { toast('SSH Password is required', 'error'); return; }
+
+  closeModal('modal-server');
+  $('modal-deploy').classList.remove('hidden');
+  $('deploy-terminal').textContent = '';
+  $('deploy-spinner').classList.remove('hidden');
+  $('btn-deploy-close').classList.add('hidden');
+  $('deploy-modal-title').textContent = `Deploying to ${host}...`;
+  $('deploy-status-text').textContent = 'Connecting...';
+
+  apiFetch('/api/deploy/start', {
+    method: 'POST',
+    body: { host, port: parseInt(port), username: user, password: pass, server_name: name }
+  }).then(data => {
+    trackDeployment(data.deploy_id, name, notes);
+  }).catch(e => {
+    $('deploy-terminal').textContent += `\nERROR: ${e.message}`;
+    $('deploy-spinner').classList.add('hidden');
+    $('btn-deploy-close').classList.remove('hidden');
+    $('deploy-status-text').textContent = 'Failed to start deployment';
+  });
+}
+
+function trackDeployment(id, name, notes) {
+  if (deployInterval) clearInterval(deployInterval);
+  
+  deployInterval = setInterval(async () => {
+    try {
+      const data = await apiFetch(`/api/deploy/status/${id}`);
+      $('deploy-terminal').textContent = data.logs.join('\n');
+      $('deploy-terminal').scrollTop = $('deploy-terminal').scrollHeight;
+
+      if (data.status === 'success') {
+        clearInterval(deployInterval);
+        $('deploy-spinner').classList.add('hidden');
+        $('deploy-modal-title').textContent = '✓ Deployment Complete!';
+        $('deploy-status-text').innerHTML = `<span style="color:var(--success)">Agent online at ${data.agent_url}</span>`;
+        $('btn-deploy-close').classList.remove('hidden');
+        toast('Deployment successful!', 'success');
+        // Auto-register server in dashboard
+        await apiFetch('/api/servers', {
+          method: 'POST',
+          body: { name, host: data.agent_url, admin_token: data.token, notes }
+        });
+        loadOverview();
+      } else if (data.status === 'failed') {
+        clearInterval(deployInterval);
+        $('deploy-spinner').classList.add('hidden');
+        $('deploy-modal-title').textContent = '✗ Deployment Failed';
+        $('deploy-status-text').innerHTML = `<span style="color:var(--danger)">Check the logs above for details</span>`;
+        $('btn-deploy-close').classList.remove('hidden');
+        toast('Deployment failed — see logs', 'error');
+      } else {
+        $('deploy-status-text').textContent = `Status: ${data.status.toUpperCase()} (${data.logs.length} steps)`;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, 1500);
+}
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
@@ -745,8 +885,13 @@ async function loadServersTable() {
 
 function openAddServer() {
   editingServerId = null;
+  setAddMode('api');
   $('modal-server-title').textContent = 'Add Server';
+  // Reset API fields
   ['f-srv-name','f-srv-host','f-srv-token','f-srv-notes'].forEach(id=>$(id).value='');
+  // Reset SSH fields
+  ['f-ssh-name','f-ssh-host','f-ssh-user','f-ssh-pass'].forEach(id=>$(id).value='');
+  $('f-ssh-port').value = '22';
   $('modal-server').classList.remove('hidden');
 }
 
@@ -755,6 +900,7 @@ async function openEditServer(id) {
   const s = servers.find(sv=>sv.id===id);
   if(!s) return;
   editingServerId = id;
+  setAddMode('api');  // Editing always uses API mode
   $('modal-server-title').textContent = 'Edit Server';
   $('f-srv-name').value = s.name;
   $('f-srv-host').value = s.host;
@@ -764,10 +910,17 @@ async function openEditServer(id) {
 }
 
 async function saveServer() {
+  const notes = $('f-srv-notes').value.trim();
+
+  if (addMode === 'ssh' && !editingServerId) {
+    startDeployment();
+    return;
+  }
+
   const name = $('f-srv-name').value.trim();
   const host = $('f-srv-host').value.trim();
   const token = $('f-srv-token').value.trim();
-  const notes = $('f-srv-notes').value.trim();
+
   if(!name||!host||!token) { toast('Name, Host, and Admin Token are required','error'); return; }
   try {
     if(editingServerId) {

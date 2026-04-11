@@ -77,4 +77,3 @@ A Next.js dashboard that aggregates multiple Shadow-Lab server agents, enabling 
 ### Attribution
 
 *This project is explicitly developed and maintained by **[crimsonej](https://github.com/crimsonej/crimsonej)** under the Shadow-Lab moniker.* 
-# shadow-lab
