@@ -118,3 +118,52 @@ def record_usage(key: str, tokens_in: int = 0, tokens_out: int = 0) -> None:
         data[key]["tokens_in"] = data[key].get("tokens_in", 0) + tokens_in
         data[key]["tokens_out"] = data[key].get("tokens_out", 0) + tokens_out
         _save(data)
+
+
+def rotate_key(old_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Rotate an API key: generates a new secret while preserving all metadata
+    and usage counters. The old key is disabled.
+
+    Returns the new key record, or None if old_key not found.
+    """
+    with _lock:
+        data = _load()
+        if old_key not in data:
+            return None
+
+        # Copy all metadata and usage from old key
+        old_record = data[old_key].copy()
+        old_record["enabled"] = False
+        data[old_key] = old_record
+
+        # Generate new key with same metadata
+        new_key = "sk-" + secrets.token_hex(24)
+        new_record = old_record.copy()
+        new_record["enabled"] = True
+        new_record["rotated_from"] = old_key
+        new_record["rotated_at"] = datetime.now(timezone.utc).isoformat()
+        data[new_key] = new_record
+
+        _save(data)
+    return {"key": new_key, **new_record}
+
+
+def get_usage(key: str) -> Optional[Dict[str, Any]]:
+    """Return detailed usage breakdown for a specific key."""
+    with _lock:
+        data = _load()
+        record = data.get(key)
+    if not record:
+        return None
+    return {
+        "key": key[:12] + "...",
+        "label": record.get("label", ""),
+        "requests": record.get("requests", 0),
+        "tokens_in": record.get("tokens_in", 0),
+        "tokens_out": record.get("tokens_out", 0),
+        "tokens_total": record.get("tokens_in", 0) + record.get("tokens_out", 0),
+        "created_at": record.get("created_at", ""),
+        "last_used": record.get("last_used"),
+        "enabled": record.get("enabled", False),
+    }

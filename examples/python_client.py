@@ -1,7 +1,7 @@
 """
 examples/python_client.py
 ─────────────────────────────────────────────────────────────────────────────
-Demonstrates how to use the Ollama API Provider from Python.
+Demonstrates how to use the Shadow-Lab Agent from Python.
 
 Compatible with the openai Python SDK (pip install openai).
 Also shows raw httpx usage without any SDK.

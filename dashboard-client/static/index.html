@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Ollama API Dashboard</title>
+<title>Shadow-Lab Control Plane</title>
 <style>
   :root {
     --bg: #0f1117; --bg2: #1a1d27; --bg3: #22263a;
@@ -154,6 +154,31 @@
   .empty { text-align: center; padding: 48px 24px; color: var(--muted); }
   .empty-icon { font-size: 40px; margin-bottom: 12px; }
   .empty-title { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+
+  /* Control Plane Panels */
+  .cp-grid { display: grid; gap: 12px; margin-bottom: 20px; }
+  .cp-grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .cp-grid-2 { grid-template-columns: 1fr 1fr; }
+  @media (max-width: 900px) { .cp-grid-3, .cp-grid-2 { grid-template-columns: 1fr; } }
+  .test-result { padding: 10px 14px; border-radius: 8px; font-size: 13px; display: flex;
+    align-items: center; gap: 8px; }
+  .test-pass { background: rgba(16,185,129,.08); border: 1px solid rgba(16,185,129,.2); }
+  .test-fail { background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.2); }
+  .log-entry { padding: 6px 12px; font-family: 'Courier New', monospace; font-size: 11.5px;
+    border-bottom: 1px solid var(--border); line-height: 1.5; }
+  .log-entry:last-child { border-bottom: none; }
+  .log-entry.error { color: var(--danger); background: rgba(239,68,68,.04); }
+  .log-entry.warning { color: var(--warn); }
+  .log-scroll { max-height: 400px; overflow-y: auto; }
+  .lifecycle-btn { padding: 12px 20px; border-radius: 10px; background: var(--bg3);
+    border: 1px solid var(--border); cursor: pointer; text-align: center; transition: all .15s; }
+  .lifecycle-btn:hover { background: var(--border); transform: translateY(-1px); }
+  .lifecycle-btn .lc-icon { font-size: 24px; margin-bottom: 6px; }
+  .lifecycle-btn .lc-label { font-size: 13px; font-weight: 600; color: var(--text); }
+  .lifecycle-btn .lc-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .uptime-bar { height: 8px; background: var(--bg3); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .uptime-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 4px;
+    transition: width .6s ease; }
 </style>
 </head>
 <body>
@@ -165,9 +190,13 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/>
         </svg>
-        OllamaAPI
+        Shadow-Lab
       </div>
-      <div class="sidebar-sub">Local AI Infrastructure</div>
+      <div class="sidebar-sub">
+        <a href="https://github.com/crimsonej/shadow-lab" target="_blank" style="color:var(--muted);text-decoration:none;transition:color .15s" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--muted)'">
+          by @crimsonej
+        </a>
+      </div>
     </div>
     <div style="padding:8px">
       <div class="nav-section">Navigation</div>
@@ -237,9 +266,13 @@
       <!-- Metrics -->
       <div class="grid-4" id="detail-metric-cards" style="margin-bottom:24px"></div>
 
-      <div class="tabs">
+      <div class="tabs" id="detail-tabs">
         <div class="tab active" onclick="switchTab('models')">Models</div>
         <div class="tab" onclick="switchTab('keys')">API Keys</div>
+        <div class="tab" onclick="switchTab('testing')">Testing</div>
+        <div class="tab" onclick="switchTab('lifecycle')">Lifecycle</div>
+        <div class="tab" onclick="switchTab('uptime')">Uptime</div>
+        <div class="tab" onclick="switchTab('logs')">Logs</div>
       </div>
 
       <!-- Models tab -->
@@ -281,6 +314,122 @@
           </div>
         </div>
       </div>
+
+      <!-- Testing tab -->
+      <div id="tab-testing" class="hidden">
+        <div class="section-header">
+          <div class="section-title">Model & API Testing</div>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:20px">
+          <div class="card">
+            <div class="card-title">Model Health Check</div>
+            <p style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Test all installed models with a diagnostic probe.</p>
+            <button class="btn btn-primary btn-sm" id="btn-model-health" onclick="runModelHealth()">
+              <span id="model-health-spin" class="hidden"><span class="spin" style="width:14px;height:14px;display:inline-block"></span></span>
+              Run Health Check
+            </button>
+            <div id="model-health-results" style="margin-top:14px"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">API Integrity Test</div>
+            <p style="font-size:12.5px;color:var(--muted);margin-bottom:12px">Run end-to-end API tests (connectivity, completions, streaming).</p>
+            <div style="display:flex;gap:8px;margin-bottom:12px">
+              <input id="api-test-model" placeholder="Model name e.g. llama3:8b" style="flex:1"/>
+              <button class="btn btn-primary btn-sm" id="btn-api-test" onclick="runApiTest()">
+                <span id="api-test-spin" class="hidden"><span class="spin" style="width:14px;height:14px;display:inline-block"></span></span>
+                Run Test
+              </button>
+            </div>
+            <div id="api-test-results"></div>
+          </div>
+        </div>
+
+        <div class="card" id="single-model-test-card">
+          <div class="card-title">Test Individual Model</div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <input id="test-model-name" placeholder="Model name" style="width:180px"/>
+            <input id="test-model-prompt" placeholder="Custom prompt (optional)" style="flex:1"/>
+            <button class="btn btn-secondary btn-sm" onclick="runSingleModelTest()">Test</button>
+          </div>
+          <div id="single-model-result" style="margin-top:12px"></div>
+        </div>
+      </div>
+
+      <!-- Lifecycle tab -->
+      <div id="tab-lifecycle" class="hidden">
+        <div class="section-header">
+          <div class="section-title">Server Lifecycle Control</div>
+        </div>
+        <div class="cp-grid cp-grid-3" style="margin-bottom:20px">
+          <div class="lifecycle-btn" onclick="lifecycleAction('restart-ollama')">
+            <div class="lc-icon">🔄</div>
+            <div class="lc-label">Restart Ollama</div>
+            <div class="lc-sub">Restart the AI inference engine</div>
+          </div>
+          <div class="lifecycle-btn" onclick="lifecycleAction('restart-agent')">
+            <div class="lc-icon">⚡</div>
+            <div class="lc-label">Restart Agent</div>
+            <div class="lc-sub">Restart the API provider agent</div>
+          </div>
+          <div class="lifecycle-btn" onclick="lifecycleAction('stop-agent')">
+            <div class="lc-icon">⏹️</div>
+            <div class="lc-label">Stop Agent</div>
+            <div class="lc-sub">Gracefully stop the agent</div>
+          </div>
+        </div>
+        <div class="card" id="lifecycle-status-card">
+          <div class="card-title">Current Status</div>
+          <div id="lifecycle-status" style="margin-top:8px">Click a button above or refresh to check status.</div>
+        </div>
+      </div>
+
+      <!-- Uptime tab -->
+      <div id="tab-uptime" class="hidden">
+        <div class="section-header">
+          <div class="section-title">Uptime & Runtime</div>
+          <button class="btn btn-secondary btn-sm" onclick="loadUptime()">↻ Refresh</button>
+        </div>
+        <div class="grid-4" style="margin-bottom:20px">
+          <div class="card" id="uptime-current">
+            <div class="card-title">Current Session</div>
+            <div class="card-value" id="uptime-current-val">—</div>
+          </div>
+          <div class="card">
+            <div class="card-title">This Month</div>
+            <div class="card-value" id="uptime-monthly-val">—</div>
+          </div>
+          <div class="card">
+            <div class="card-title">Last Boot</div>
+            <div class="card-value" id="uptime-boot" style="font-size:16px">—</div>
+          </div>
+          <div class="card">
+            <div class="card-title">Total Sessions</div>
+            <div class="card-value" id="uptime-sessions">—</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Monthly Runtime History</div>
+          <div id="monthly-runtime-list" style="margin-top:12px"></div>
+        </div>
+      </div>
+
+      <!-- Logs tab -->
+      <div id="tab-logs" class="hidden">
+        <div class="section-header">
+          <div class="section-title">Agent Logs</div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-secondary btn-sm" onclick="loadLogs('recent')">Recent</button>
+            <button class="btn btn-danger btn-sm" onclick="loadLogs('errors')">Errors Only</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="log-scroll" id="log-entries">
+            <div style="text-align:center;color:var(--muted);padding:32px">Click "Recent" or "Errors Only" to load logs.</div>
+          </div>
+        </div>
+      </div>
+
     </div>
 
     <!-- SERVERS LIST VIEW -->
@@ -562,12 +711,19 @@ function showView(view) {
 
 function switchTab(tab) {
   currentTab = tab;
-  document.querySelectorAll('.tab').forEach((t,i)=>{
-    t.classList.toggle('active', ['models','keys'][i]===tab);
+  const allTabs = ['models','keys','testing','lifecycle','uptime','logs'];
+  document.querySelectorAll('#detail-tabs .tab').forEach((t,i)=>{
+    t.classList.toggle('active', allTabs[i]===tab);
   });
-  $('tab-models').classList.toggle('hidden', tab!=='models');
-  $('tab-keys').classList.toggle('hidden', tab!=='keys');
+  allTabs.forEach(t => {
+    const el = $(`tab-${t}`);
+    if(el) el.classList.toggle('hidden', t!==tab);
+  });
   if(tab==='keys') loadKeys(currentServerId);
+  if(tab==='testing') {} // loaded on-demand via buttons
+  if(tab==='lifecycle') loadLifecycleStatus();
+  if(tab==='uptime') loadUptime();
+  if(tab==='logs') loadLogs('recent');
 }
 
 // ── Overview ─────────────────────────────────────────────────────────────────
@@ -847,6 +1003,179 @@ async function deleteKey(key) {
 }
 
 function copyKey() { navigator.clipboard.writeText(newKeyValue); toast('Key copied!','success'); }
+
+// ── Control Plane: Model Testing ──────────────────────────────────────────────
+
+async function runModelHealth() {
+  $('btn-model-health').disabled = true;
+  $('model-health-results').innerHTML = '<div class="spin" style="margin:12px auto"></div>';
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/models/health`);
+    let html = `<div style="font-size:12px;color:var(--muted);margin-bottom:10px">${data.healthy}/${data.total_models} models healthy</div>`;
+    (data.models||[]).forEach(m => {
+      const ok = m.status === 'pass';
+      html += `<div class="test-result ${ok?'test-pass':'test-fail'}">
+        <span>${ok?'✓':'✗'}</span>
+        <span class="mono">${m.model}</span>
+        <span style="margin-left:auto;font-size:11px;color:var(--muted)">${m.latency_ms}ms</span>
+        ${m.error?`<span style="font-size:11px;color:var(--danger)">${m.error}</span>`:''}
+      </div>`;
+    });
+    $('model-health-results').innerHTML = html;
+  } catch(e) { $('model-health-results').innerHTML = `<span style="color:var(--danger)">${e.message}</span>`; }
+  $('btn-model-health').disabled = false;
+}
+
+async function runApiTest() {
+  const model = $('api-test-model').value.trim();
+  if(!model) { toast('Enter a model name','error'); return; }
+  $('btn-api-test').disabled = true;
+  $('api-test-results').innerHTML = '<div class="spin" style="margin:12px auto"></div>';
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/test-api`, {
+      method:'POST', body:{model}
+    });
+    const statusColor = data.status==='PASS'?'var(--success)':'var(--danger)';
+    let html = `<div style="font-size:14px;font-weight:700;color:${statusColor};margin-bottom:10px">
+      ${data.status} — ${data.passed_count}/${data.passed_count+data.failed_count} tests passed (${data.total_latency_ms}ms total)
+    </div>`;
+    (data.tests||[]).forEach(t => {
+      const ok = t.passed;
+      html += `<div class="test-result ${ok?'test-pass':'test-fail'}" style="margin-bottom:4px">
+        <span>${ok?'✓':'✗'}</span>
+        <span style="font-weight:600">${t.name.replace(/_/g,' ')}</span>
+        <span style="margin-left:auto;font-size:11px;color:var(--muted)">${t.latency_ms}ms</span>
+        ${t.error?`<br><span style="font-size:11px;color:var(--danger);margin-left:20px">${t.error}</span>`:''}
+      </div>`;
+    });
+    $('api-test-results').innerHTML = html;
+  } catch(e) { $('api-test-results').innerHTML = `<span style="color:var(--danger)">${e.message}</span>`; }
+  $('btn-api-test').disabled = false;
+}
+
+async function runSingleModelTest() {
+  const name = $('test-model-name').value.trim();
+  if(!name) { toast('Enter a model name','error'); return; }
+  const prompt = $('test-model-prompt').value.trim();
+  $('single-model-result').innerHTML = '<div class="spin" style="margin:8px 0"></div>';
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/test-model`, {
+      method:'POST', body:{name, prompt}
+    });
+    const ok = data.status==='pass';
+    $('single-model-result').innerHTML = `
+      <div class="test-result ${ok?'test-pass':'test-fail'}">
+        <span>${ok?'✓':'✗'}</span>
+        <span class="mono">${data.model}</span>
+        <span style="margin-left:12px;font-size:12px">${data.latency_ms}ms</span>
+        ${data.tokens?`<span style="font-size:11px;color:var(--muted);margin-left:8px">${data.tokens.total} tokens</span>`:''}
+      </div>
+      ${data.response_text?`<div style="margin-top:8px;padding:10px;background:var(--bg3);border-radius:6px;font-size:12px;color:var(--muted)"><strong>Response:</strong> ${data.response_text.substring(0,200)}</div>`:''}
+      ${data.error?`<div style="margin-top:8px;color:var(--danger);font-size:12px">${data.error}</div>`:''}
+    `;
+  } catch(e) { $('single-model-result').innerHTML = `<span style="color:var(--danger)">${e.message}</span>`; }
+}
+
+// ── Control Plane: Lifecycle ──────────────────────────────────────────────────
+
+async function lifecycleAction(action) {
+  const labels = {
+    'restart-ollama': 'Restarting Ollama',
+    'restart-agent': 'Restarting Agent',
+    'stop-agent': 'Stopping Agent',
+    'start-agent': 'Starting Agent',
+  };
+  if(!confirm(`${labels[action] || action}?`)) return;
+  toast(`${labels[action]}...`, 'info');
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/lifecycle/${action}`, {method:'POST'});
+    toast(`${labels[action]}: ${data.success?'Success':'Failed'} (${data.method})`, data.success?'success':'error');
+    setTimeout(loadLifecycleStatus, 2000);
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+async function loadLifecycleStatus() {
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/lifecycle/health`, {method:'POST'});
+    const html = `
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-top:4px">
+        <div><span class="badge ${data.online?'badge-online':'badge-offline'}">
+          ${data.online?'● Agent Online':'● Agent Offline'}</span></div>
+        <div style="font-size:12px;color:var(--muted)">Connection: <strong>${data.method}</strong></div>
+        ${data.ollama_running!=null?`<div style="font-size:12px">
+          Ollama: <span style="color:${data.ollama_running?'var(--success)':'var(--danger)'}">
+          ${data.ollama_running?'Running':'Down'}</span></div>`:''}
+      </div>`;
+    $('lifecycle-status').innerHTML = html;
+  } catch(e) { $('lifecycle-status').innerHTML = `<span style="color:var(--muted);font-size:13px">Could not fetch status</span>`; }
+}
+
+// ── Control Plane: Uptime ────────────────────────────────────────────────────
+
+async function loadUptime() {
+  try {
+    const uptime = await apiFetch(`/api/servers/${currentServerId}/uptime`);
+    $('uptime-current-val').textContent = uptime.current_session_formatted || '—';
+    $('uptime-boot').textContent = uptime.last_boot ? fmtDate(uptime.last_boot) : '—';
+    $('uptime-sessions').textContent = uptime.total_sessions ?? '—';
+  } catch(e) {
+    $('uptime-current-val').textContent = '—';
+  }
+
+  try {
+    const monthly = await apiFetch(`/api/servers/${currentServerId}/monthly-runtime`);
+    $('uptime-monthly-val').textContent = monthly.current_month_formatted || '—';
+
+    const months = monthly.all_months || {};
+    const keys = Object.keys(months).sort().reverse().slice(0, 12);
+    if(keys.length) {
+      let html = '<div style="display:flex;flex-direction:column;gap:8px">';
+      const maxSec = Math.max(...keys.map(k => months[k].total_seconds || 0), 1);
+      keys.forEach(k => {
+        const sec = months[k].total_seconds || 0;
+        const pct = (sec / maxSec) * 100;
+        const hrs = (sec / 3600).toFixed(1);
+        html += `<div style="display:flex;align-items:center;gap:12px">
+          <span style="width:70px;font-size:12px;color:var(--muted)">${k}</span>
+          <div style="flex:1"><div class="uptime-bar"><div class="uptime-fill" style="width:${pct}%"></div></div></div>
+          <span style="width:60px;text-align:right;font-size:12px;font-weight:600">${hrs}h</span>
+          <span style="width:50px;text-align:right;font-size:11px;color:var(--muted)">${months[k].session_count||0} runs</span>
+        </div>`;
+      });
+      html += '</div>';
+      $('monthly-runtime-list').innerHTML = html;
+    } else {
+      $('monthly-runtime-list').innerHTML = '<div style="color:var(--muted);font-size:13px">No monthly data yet.</div>';
+    }
+  } catch(e) {
+    $('uptime-monthly-val').textContent = '—';
+  }
+}
+
+// ── Control Plane: Logs ──────────────────────────────────────────────────────
+
+async function loadLogs(type) {
+  $('log-entries').innerHTML = '<div style="text-align:center;padding:24px"><div class="spin" style="margin:0 auto"></div></div>';
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/logs/${type}?limit=150`);
+    const entries = data.entries || [];
+    if(!entries.length) {
+      $('log-entries').innerHTML = '<div style="text-align:center;color:var(--muted);padding:32px">No log entries found.</div>';
+      return;
+    }
+    $('log-entries').innerHTML = entries.map(e => {
+      const lvl = (e.level||'').toLowerCase();
+      const cls = lvl==='error'||lvl==='critical' ? 'error' : lvl==='warning' ? 'warning' : '';
+      const ts = e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : '';
+      return `<div class="log-entry ${cls}">
+        <span style="color:var(--muted);margin-right:8px">${ts}</span>
+        <span style="font-weight:600;margin-right:8px;min-width:55px;display:inline-block">${(e.level||'').toUpperCase()}</span>
+        ${e.request_id?`<span style="color:var(--accent);margin-right:8px">[${e.request_id}]</span>`:''}
+        ${e.message||''}
+      </div>`;
+    }).join('');
+  } catch(e) { $('log-entries').innerHTML = `<div style="color:var(--danger);padding:16px">${e.message}</div>`; }
+}
 
 // ── Servers management ────────────────────────────────────────────────────────
 

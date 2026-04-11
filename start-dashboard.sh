@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# start-dashboard.sh — Launch the Ollama Dashboard on your local machine
+# start-dashboard.sh — Launch the Shadow-Lab Control Plane on your local machine
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +8,7 @@ VENV="$DASHBOARD_DIR/venv"
 
 echo ""
 echo "  ╔══════════════════════════════════════════════╗"
-echo "  ║       Ollama API Dashboard — Starting        ║"
+echo "  ║      Shadow-Lab Control Plane — Starting     ║"
 echo "  ╚══════════════════════════════════════════════╝"
 echo ""
 

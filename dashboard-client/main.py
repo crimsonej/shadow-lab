@@ -1,5 +1,5 @@
 """
-main.py — Ollama Dashboard: Local Backend
+main.py — Shadow-Lab Control Plane: Local Backend
 ==========================================
 Runs on your local machine.
 Proxies management calls to remote server agents and serves the web UI.
@@ -18,6 +18,8 @@ import threading
 
 import db
 import deploy
+import server_lifecycle
+import compatibility
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -57,7 +59,7 @@ if not USE_FASTAPI:
 
 
 if USE_FASTAPI:
-    app = FastAPI(title="Ollama Dashboard", docs_url="/api/docs")
+    app = FastAPI(title="Shadow-Lab Control Plane", docs_url="/api/docs")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     _http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
@@ -270,6 +272,117 @@ if USE_FASTAPI:
         if not st:
             raise HTTPException(404, "Deployment not found")
         return st
+
+    # ── Control Plane: Model & API Testing ─────────────────────────────────
+
+    @app.post("/api/servers/{server_id}/test-model")
+    async def api_test_model(server_id: int, body: dict):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_post(
+            server["host"], server["admin_token"],
+            "/admin/test-model", {"name": body.get("name", ""), "prompt": body.get("prompt", "")}
+        )
+        return JSONResponse(content=data, status_code=code)
+
+    @app.get("/api/servers/{server_id}/models/health")
+    async def api_models_health(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_get(server["host"], server["admin_token"], "/admin/models/health")
+        return JSONResponse(content=data, status_code=code)
+
+    @app.post("/api/servers/{server_id}/test-api")
+    async def api_test_api(server_id: int, body: dict):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_post(
+            server["host"], server["admin_token"],
+            "/admin/test-api", {"model": body.get("model", "")}
+        )
+        return JSONResponse(content=data, status_code=code)
+
+    # ── Control Plane: Uptime & Runtime ─────────────────────────────────────
+
+    @app.get("/api/servers/{server_id}/uptime")
+    async def api_server_uptime(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_get(server["host"], server["admin_token"], "/metrics/uptime")
+        if code == 200 and data:
+            db.record_uptime_snapshot(
+                server_id,
+                data.get("current_session_seconds", 0),
+                0,
+            )
+        return JSONResponse(content=data, status_code=code)
+
+    @app.get("/api/servers/{server_id}/monthly-runtime")
+    async def api_monthly_runtime(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_get(server["host"], server["admin_token"], "/metrics/monthly-runtime")
+        return JSONResponse(content=data, status_code=code)
+
+    # ── Control Plane: Lifecycle ─────────────────────────────────────────────
+
+    @app.post("/api/servers/{server_id}/lifecycle/{action}")
+    async def api_lifecycle(server_id: int, action: str):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+
+        if action == "restart-ollama":
+            result = await server_lifecycle.restart_ollama(server)
+        elif action == "restart-agent":
+            result = await server_lifecycle.restart_agent(server)
+        elif action == "stop-agent":
+            result = await server_lifecycle.stop_agent(server)
+        elif action == "start-agent":
+            result = await server_lifecycle.start_agent(server)
+        elif action == "health":
+            result = await server_lifecycle.check_server_health(server)
+        else:
+            raise HTTPException(400, f"Unknown action: {action}")
+
+        return result
+
+    # ── Control Plane: Logs ──────────────────────────────────────────────────
+
+    @app.get("/api/servers/{server_id}/logs/recent")
+    async def api_logs_recent(server_id: int, limit: int = 100):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_get(
+            server["host"], server["admin_token"], f"/logs/recent?limit={limit}"
+        )
+        return JSONResponse(content=data, status_code=code)
+
+    @app.get("/api/servers/{server_id}/logs/errors")
+    async def api_logs_errors(server_id: int, limit: int = 50):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_get(
+            server["host"], server["admin_token"], f"/logs/errors?limit={limit}"
+        )
+        return JSONResponse(content=data, status_code=code)
+
+    # ── Control Plane: Compatibility ─────────────────────────────────────────
+
+    @app.get("/api/servers/{server_id}/compatibility")
+    async def api_compatibility(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        report = compatibility.full_compatibility_report(server)
+        return report
 
 else:
     # ── Flask Fallback Implementation ──────────────────────────────────────────
@@ -486,9 +599,118 @@ else:
             return jsonify({"detail": "Deployment not found"}), 404
         return jsonify(st)
 
+    # ── Control Plane: Model & API Testing (Flask) ─────────────────────────
+
+    @app.route("/api/servers/<int:server_id>/test-model", methods=["POST"])
+    def api_test_model(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        body = request.get_json()
+        code, data = _proxy_post(
+            server["host"], server["admin_token"],
+            "/admin/test-model", {"name": body.get("name", ""), "prompt": body.get("prompt", "")}
+        )
+        return jsonify(data), code
+
+    @app.route("/api/servers/<int:server_id>/models/health", methods=["GET"])
+    def api_models_health(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        code, data = _proxy_get(server["host"], server["admin_token"], "/admin/models/health")
+        return jsonify(data), code
+
+    @app.route("/api/servers/<int:server_id>/test-api", methods=["POST"])
+    def api_test_api(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        body = request.get_json()
+        code, data = _proxy_post(
+            server["host"], server["admin_token"],
+            "/admin/test-api", {"model": body.get("model", "")}
+        )
+        return jsonify(data), code
+
+    # ── Control Plane: Uptime (Flask) ──────────────────────────────────────
+
+    @app.route("/api/servers/<int:server_id>/uptime", methods=["GET"])
+    def api_server_uptime(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        code, data = _proxy_get(server["host"], server["admin_token"], "/metrics/uptime")
+        return jsonify(data), code
+
+    @app.route("/api/servers/<int:server_id>/monthly-runtime", methods=["GET"])
+    def api_monthly_runtime(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        code, data = _proxy_get(server["host"], server["admin_token"], "/metrics/monthly-runtime")
+        return jsonify(data), code
+
+    # ── Control Plane: Lifecycle (Flask) ────────────────────────────────────
+
+    @app.route("/api/servers/<int:server_id>/lifecycle/<action>", methods=["POST"])
+    def api_lifecycle(server_id, action):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        # Lifecycle uses async functions — run via threading for Flask
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            if action == "restart-ollama":
+                result = loop.run_until_complete(server_lifecycle.restart_ollama(server))
+            elif action == "restart-agent":
+                result = loop.run_until_complete(server_lifecycle.restart_agent(server))
+            elif action == "stop-agent":
+                result = loop.run_until_complete(server_lifecycle.stop_agent(server))
+            elif action == "start-agent":
+                result = loop.run_until_complete(server_lifecycle.start_agent(server))
+            elif action == "health":
+                result = loop.run_until_complete(server_lifecycle.check_server_health(server))
+            else:
+                return jsonify({"detail": f"Unknown action: {action}"}), 400
+        finally:
+            loop.close()
+        return jsonify(result)
+
+    # ── Control Plane: Logs (Flask) ────────────────────────────────────────
+
+    @app.route("/api/servers/<int:server_id>/logs/recent", methods=["GET"])
+    def api_logs_recent(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        limit = request.args.get("limit", 100, type=int)
+        code, data = _proxy_get(server["host"], server["admin_token"], f"/logs/recent?limit={limit}")
+        return jsonify(data), code
+
+    @app.route("/api/servers/<int:server_id>/logs/errors", methods=["GET"])
+    def api_logs_errors(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        limit = request.args.get("limit", 50, type=int)
+        code, data = _proxy_get(server["host"], server["admin_token"], f"/logs/errors?limit={limit}")
+        return jsonify(data), code
+
+    # ── Control Plane: Compatibility (Flask) ───────────────────────────────
+
+    @app.route("/api/servers/<int:server_id>/compatibility", methods=["GET"])
+    def api_compatibility(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        report = compatibility.full_compatibility_report(server)
+        return jsonify(report)
+
 
 if __name__ == "__main__":
-    print(f"\n  Ollama Dashboard running at: http://localhost:{DASHBOARD_PORT}\n")
+    print(f"\n  Shadow-Lab Control Plane running at: http://localhost:{DASHBOARD_PORT}\n")
     if USE_FASTAPI:
         uvicorn.run("main:app", host="127.0.0.1", port=DASHBOARD_PORT, reload=False, log_level="warning")
     else:

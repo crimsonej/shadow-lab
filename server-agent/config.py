@@ -31,6 +31,25 @@ GPU_MONITORING: bool = os.getenv("GPU_MONITORING", "true").lower() == "true"
 # Rate-limit: max requests per minute per API key (0 = unlimited)
 RATE_LIMIT_RPM: int = int(os.getenv("RATE_LIMIT_RPM", "0"))
 
+# ── New: Control Plane Extensions ─────────────────────────────────────────────
+
+# Persistent data directory for uptime tracking, logs, etc.
+DATA_DIR: Path = Path(os.getenv("DATA_DIR", "/var/lib/ollama-agent"))
+
+# Default test prompt used by model health checks
+TEST_PROMPT: str = os.getenv(
+    "TEST_PROMPT", "Reply with OK if you are functioning correctly"
+)
+
+# Maximum structured log entries kept in the in-memory ring buffer
+LOG_BUFFER_SIZE: int = int(os.getenv("LOG_BUFFER_SIZE", "500"))
+
+# Structured log file path
+LOG_FILE: Path = DATA_DIR / "agent.log"
+
+# Ensure data directory exists at import time
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 def ensure_admin_token() -> str:
     """Return the admin token, generating+printing one if not set."""
     global ADMIN_TOKEN

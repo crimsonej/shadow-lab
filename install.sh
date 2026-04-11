@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  install.sh — Ollama API Provider: Server Agent Installer
+#  install.sh — Shadow-Lab: Control Plane Installer
 #  Supports: Ubuntu 20.04+, Debian 11+, Arch Linux
 #  Usage:
-#    curl -fsSL https://raw.githubusercontent.com/you/ollama-api-provider/main/install.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/crimsonej/shadow-lab/main/install.sh | bash
 #    OR: bash install.sh
 # =============================================================================
 
@@ -29,7 +29,7 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 banner() {
   echo -e "${BOLD}"
   echo "  ╔══════════════════════════════════════════════╗"
-  echo "  ║       Ollama API Provider — Installer        ║"
+  echo "  ║            Shadow-Lab — Installer            ║"
   echo "  ║   Turns your Linux server into an AI API     ║"
   echo "  ╚══════════════════════════════════════════════╝"
   echo -e "${NC}"
@@ -44,7 +44,7 @@ detect_os() {
   elif [ -f /etc/arch-release ]; then
     OS="arch"
   else
-    error "Cannot detect OS. Supported: Ubuntu, Debian, Arch."
+    error "Cannot detect OS. Supported: Ubuntu, Debian, Arch, Parrot, Kali, CentOS, Fedora."
   fi
   info "Detected OS: $OS"
 }
@@ -52,10 +52,14 @@ detect_os() {
 # ── Package management ────────────────────────────────────────────────────────
 pkg_install() {
   case "$OS" in
-    ubuntu|debian|linuxmint|pop)
+    ubuntu|debian|linuxmint|pop|parrot|kali|raspbian)
       DEBIAN_FRONTEND=noninteractive apt-get install -yq "$@" ;;
-    arch|manjaro|endeavouros)
+    arch|manjaro|endeavouros|garuda)
       pacman -Syu --noconfirm "$@" ;;
+    centos|rhel|rocky|almalinux)
+      yum install -y "$@" ;;
+    fedora)
+      dnf install -y "$@" ;;
     *)
       if echo "$OS_LIKE" | grep -q "debian"; then
         DEBIAN_FRONTEND=noninteractive apt-get install -yq "$@"
@@ -86,20 +90,60 @@ install_python() {
   info "Checking Python 3..."
   if command -v python3 &>/dev/null; then
     VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+    MAJOR=$(python3 -c "import sys; print(sys.version_info.major)")
+    MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
     info "Found Python $VER"
+
+    # Version enforcement
+    if [ "$MAJOR" -lt 3 ] || ([ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 9 ]); then
+      error "Python $VER is too old. Minimum required: Python 3.9. Please upgrade."
+    elif [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 13 ]; then
+      warn "Python $VER detected. Python 3.13+ has known compatibility issues"
+      warn "with pydantic-core and FastAPI. Recommended: Python 3.10-3.12."
+      warn ""
+      # Try to find a compatible Python on the system
+      for pybin in python3.12 python3.11 python3.10; do
+        if command -v "$pybin" &>/dev/null; then
+          success "Found compatible $pybin — will use it instead."
+          PYTHON_BIN="$pybin"
+          return
+        fi
+      done
+      # On Ubuntu/Debian, try installing python3.12 from deadsnakes
+      if [ "$OS" = "ubuntu" ]; then
+        warn "Attempting to install Python 3.12 from deadsnakes PPA..."
+        add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
+        apt-get update -yq 2>/dev/null
+        apt-get install -yq python3.12 python3.12-venv 2>/dev/null
+        if command -v python3.12 &>/dev/null; then
+          success "Python 3.12 installed from deadsnakes."
+          PYTHON_BIN="python3.12"
+          return
+        fi
+      fi
+      warn "Proceeding with Python $VER — some dependencies may fail to install."
+    fi
+    if [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 10 ] && [ "$MINOR" -le 12 ]; then
+      success "Python $VER is in the optimal range (3.10-3.12) ✓"
+    fi
   else
     info "Installing Python 3..."
     case "$OS" in
-      ubuntu|debian|linuxmint|pop) pkg_install python3 python3-pip python3-venv ;;
-      arch|manjaro|endeavouros)    pkg_install python python-pip ;;
+      ubuntu|debian|linuxmint|pop|parrot|kali) pkg_install python3 python3-pip python3-venv ;;
+      arch|manjaro|endeavouros|garuda)         pkg_install python python-pip ;;
+      centos|rhel|rocky|almalinux)             pkg_install python3 python3-pip ;;
+      fedora)                                  pkg_install python3 python3-pip ;;
       *) pkg_install python3 python3-pip ;;
     esac
   fi
 
+  # Set default python binary
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+
   # Ensure pip & venv
-  if ! python3 -m pip --version &>/dev/null; then
+  if ! $PYTHON_BIN -m pip --version &>/dev/null; then
     case "$OS" in
-      ubuntu|debian|linuxmint|pop) pkg_install python3-pip python3-venv ;;
+      ubuntu|debian|linuxmint|pop|parrot|kali) pkg_install python3-pip python3-venv ;;
       *) warn "pip not found — install manually if needed" ;;
     esac
   fi
@@ -189,8 +233,8 @@ install_systemd_service() {
   info "Installing systemd service: $SERVICE_NAME ..."
   cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Ollama API Provider Agent
-After=network.target ollama.service
+Description=Shadow-Lab Agent
+After=network-online.target ollama.service
 Wants=ollama.service
 
 [Service]
@@ -240,7 +284,7 @@ print_summary() {
 
   echo ""
   echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}  ✅  Ollama API Provider Agent Installed!${NC}"
+  echo -e "${BOLD}  ✅  Shadow-Lab Agent Installed!${NC}"
   echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
   echo ""
   echo -e "  ${BOLD}Agent URL:${NC}    http://${PUBLIC_IP}:${AGENT_PORT}"
@@ -260,12 +304,63 @@ print_summary() {
   echo ""
 }
 
+# ── Check-only mode ────────────────────────────────────────────────────────
+check_only() {
+  banner
+  info "Running compatibility check (dry run — no changes will be made)..."
+  detect_os
+
+  echo ""
+  info "Python status:"
+  if command -v python3 &>/dev/null; then
+    VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
+    MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
+    if [ "$MINOR" -ge 10 ] && [ "$MINOR" -le 12 ]; then
+      success "Python $VER — COMPATIBLE"
+    elif [ "$MINOR" -ge 13 ]; then
+      warn "Python $VER — INCOMPATIBLE (3.13+ has pydantic-core issues)"
+    else
+      warn "Python $VER — version may be too old"
+    fi
+  else
+    warn "Python 3 not found"
+  fi
+
+  echo ""
+  info "Ollama status:"
+  if command -v ollama &>/dev/null; then
+    success "Ollama installed: $(ollama --version 2>/dev/null || echo 'version unknown')"
+  else
+    warn "Ollama not installed"
+  fi
+
+  echo ""
+  info "Required tools:"
+  for tool in curl tar git; do
+    if command -v "$tool" &>/dev/null; then
+      success "$tool — found"
+    else
+      warn "$tool — missing"
+    fi
+  done
+
+  echo ""
+  success "Compatibility check complete. No changes were made."
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
+  # Support --check-only flag
+  if [ "${1:-}" = "--check-only" ]; then
+    check_only
+    exit 0
+  fi
+
   banner
   check_root
   detect_os
   pkg_update
+  PYTHON_BIN="python3"  # may be overridden by install_python
   install_python
   install_ollama
   start_ollama

@@ -45,7 +45,25 @@ def init_db() -> None:
                 FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
             )
         """)
+        # ── Control Plane: uptime snapshots ───────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS uptime_snapshots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id   INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                uptime_seconds REAL,
+                monthly_seconds REAL,
+                FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+            )
+        """)
         conn.commit()
+
+        # ── Schema migration: add SSH columns if missing ──────────────────
+        _migrate_add_column(conn, "servers", "connection_type", "TEXT DEFAULT 'http'")
+        _migrate_add_column(conn, "servers", "ssh_host", "TEXT DEFAULT ''")
+        _migrate_add_column(conn, "servers", "ssh_user", "TEXT DEFAULT ''")
+        _migrate_add_column(conn, "servers", "ssh_port", "INTEGER DEFAULT 22")
+        _migrate_add_column(conn, "servers", "ssh_key_path", "TEXT DEFAULT ''")
 
 
 # ── Server CRUD ───────────────────────────────────────────────────────────────
@@ -135,3 +153,82 @@ def remove_cached_key(server_id: int, api_key: str) -> None:
             "DELETE FROM key_cache WHERE server_id=? AND api_key=?", (server_id, api_key)
         )
         conn.commit()
+
+
+# ── Schema migration helper ──────────────────────────────────────────────────
+
+def _migrate_add_column(conn, table: str, column: str, col_type: str) -> None:
+    """Add a column to a table if it doesn't already exist. Idempotent."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+
+# ── Uptime snapshots ─────────────────────────────────────────────────────────
+
+def record_uptime_snapshot(
+    server_id: int, uptime_seconds: float, monthly_seconds: float
+) -> None:
+    """Record a point-in-time uptime snapshot for a server."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO uptime_snapshots (server_id, recorded_at, uptime_seconds, monthly_seconds) VALUES (?,?,?,?)",
+            (server_id, datetime.now(timezone.utc).isoformat(), uptime_seconds, monthly_seconds),
+        )
+        conn.commit()
+
+
+def get_uptime_history(server_id: int, limit: int = 100) -> List[Dict]:
+    """Return recent uptime snapshots for a server."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM uptime_snapshots WHERE server_id=? ORDER BY id DESC LIMIT ?",
+            (server_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Extended server CRUD with SSH fields ─────────────────────────────────────
+
+def add_server_full(
+    name: str, host: str, admin_token: str, notes: str = "",
+    connection_type: str = "http", ssh_host: str = "", ssh_user: str = "",
+    ssh_port: int = 22, ssh_key_path: str = "",
+) -> Dict:
+    """Add a server with full SSH configuration."""
+    host = host.rstrip("/")
+    if not host.startswith("http"):
+        host = "http://" + host
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO servers (name, host, admin_token, added_at, notes, "
+            "connection_type, ssh_host, ssh_user, ssh_port, ssh_key_path) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (name, host, admin_token, datetime.now(timezone.utc).isoformat(),
+             notes, connection_type, ssh_host, ssh_user, ssh_port, ssh_key_path),
+        )
+        conn.commit()
+        return get_server(cur.lastrowid)
+
+
+def update_server_full(
+    server_id: int, name: str, host: str, admin_token: str, notes: str = "",
+    connection_type: str = "http", ssh_host: str = "", ssh_user: str = "",
+    ssh_port: int = 22, ssh_key_path: str = "",
+) -> Optional[Dict]:
+    """Update a server with full SSH configuration."""
+    host = host.rstrip("/")
+    if not host.startswith("http"):
+        host = "http://" + host
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE servers SET name=?, host=?, admin_token=?, notes=?, "
+            "connection_type=?, ssh_host=?, ssh_user=?, ssh_port=?, ssh_key_path=? "
+            "WHERE id=?",
+            (name, host, admin_token, notes,
+             connection_type, ssh_host, ssh_user, ssh_port, ssh_key_path, server_id),
+        )
+        conn.commit()
+    return get_server(server_id)

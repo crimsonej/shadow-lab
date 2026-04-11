@@ -1,5 +1,5 @@
 """
-main.py — Ollama API Provider: Server Agent
+main.py — Shadow-Lab Agent: Inference Provider Server
 ============================================
 Exposes OpenAI-compatible REST endpoints backed by a local Ollama instance.
 
@@ -35,6 +35,10 @@ import config
 import metrics
 import ollama_client
 import schemas
+import model_tester
+import api_tester
+import uptime_tracker
+import structured_logger
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -60,14 +64,19 @@ async def lifespan(app: FastAPI):
         log.info("Ollama is reachable ✓")
     else:
         log.warning("Ollama is NOT reachable — requests will fail until it starts")
+    # Record boot for uptime tracking
+    uptime_tracker.record_boot()
     yield
+    # Record shutdown for uptime tracking
+    uptime_tracker.record_shutdown()
     client = ollama_client._client
     if client and not client.is_closed:
         await client.aclose()
 
 
 app = FastAPI(
-    title="Ollama API Provider — Server Agent",
+    title="Shadow-Lab Agent",
+    description="Inference provider and control-plane endpoint for Shadow-Lab",
     version=AGENT_VERSION,
     lifespan=lifespan,
     docs_url="/docs",
@@ -80,6 +89,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Structured request logging middleware
+app.add_middleware(structured_logger.RequestIdMiddleware)
 
 
 # ── Dependency: validate API key ──────────────────────────────────────────────
@@ -236,6 +248,24 @@ def admin_delete_key(body: schemas.DeleteKeyRequest, _: str = Depends(require_ad
     return {"status": "deleted"}
 
 
+@app.post("/admin/keys/rotate", tags=["Admin"])
+def admin_rotate_key(body: schemas.RevokeKeyRequest, _: str = Depends(require_admin)):
+    """Rotate an API key: disable old key and generate a new one with the same metadata."""
+    result = auth.rotate_key(body.key)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return result
+
+
+@app.get("/admin/keys/usage", tags=["Admin"])
+def admin_key_usage(key: str, _: str = Depends(require_admin)):
+    """Get detailed usage stats for a specific API key."""
+    usage = auth.get_usage(key)
+    if usage is None:
+        raise HTTPException(status_code=404, detail="Key not found")
+    return usage
+
+
 # ── Admin: model management ───────────────────────────────────────────────────
 
 @app.post("/admin/models/pull", tags=["Admin"])
@@ -267,6 +297,116 @@ async def admin_list_models(_: str = Depends(require_admin)):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
     return {"models": models}
+
+
+# ── Control Plane: Model Testing ──────────────────────────────────────────────
+
+@app.post("/admin/test-model", tags=["Admin"])
+async def admin_test_model(body: schemas.TestModelRequest, _: str = Depends(require_admin)):
+    """Test a specific model to verify it is installed, loadable, and responding."""
+    result = await model_tester.test_model(
+        model_name=body.name,
+        prompt=body.prompt or None,
+    )
+    return result
+
+
+@app.get("/admin/models/health", tags=["Admin"])
+async def admin_models_health(_: str = Depends(require_admin)):
+    """Run a health check on all installed models."""
+    results = await model_tester.health_check_all_models()
+    passed = sum(1 for r in results if r.get("status") == "pass")
+    return {
+        "total_models": len(results),
+        "healthy": passed,
+        "unhealthy": len(results) - passed,
+        "models": results,
+    }
+
+
+# ── Control Plane: API Integrity Testing ──────────────────────────────────────
+
+@app.post("/admin/test-api", tags=["Admin"])
+async def admin_test_api(body: schemas.TestApiRequest, _: str = Depends(require_admin)):
+    """Run the full API integrity test suite against a specific model."""
+    result = await api_tester.test_api_integrity(model=body.model)
+    return result
+
+
+# ── Control Plane: Uptime & Runtime ───────────────────────────────────────────
+
+@app.get("/metrics/uptime", tags=["Metrics"])
+async def metrics_uptime(_: str = Depends(require_admin)):
+    """Return current session uptime and boot information."""
+    return uptime_tracker.get_uptime()
+
+
+@app.get("/metrics/monthly-runtime", tags=["Metrics"])
+async def metrics_monthly_runtime(_: str = Depends(require_admin)):
+    """Return monthly runtime accumulation data."""
+    return uptime_tracker.get_monthly_runtime()
+
+
+# ── Control Plane: Server Lifecycle ───────────────────────────────────────────
+
+@app.post("/admin/lifecycle/restart-ollama", tags=["Admin"])
+async def admin_restart_ollama(_: str = Depends(require_admin)):
+    """Restart the local Ollama service via systemctl."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", "ollama"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return {"status": "ok", "message": "Ollama restart issued"}
+        else:
+            return {"status": "error", "message": result.stderr.strip() or "Non-zero exit code"}
+    except FileNotFoundError:
+        raise HTTPException(503, "systemctl not available on this system")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Timeout waiting for Ollama restart")
+
+
+@app.get("/admin/lifecycle/status", tags=["Admin"])
+async def admin_lifecycle_status(_: str = Depends(require_admin)):
+    """Return Ollama and agent process status."""
+    import subprocess
+    ollama_ok = await ollama_client.ping_ollama()
+
+    # Try to get systemd status
+    ollama_systemd = "unknown"
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "ollama"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ollama_systemd = result.stdout.strip()
+    except Exception:
+        pass
+
+    return {
+        "ollama_reachable": ollama_ok,
+        "ollama_systemd_status": ollama_systemd,
+        "agent_version": AGENT_VERSION,
+        "agent_uptime": uptime_tracker.get_uptime(),
+    }
+
+
+# ── Control Plane: Structured Logs ────────────────────────────────────────────
+
+@app.get("/logs/recent", tags=["Logs"])
+async def logs_recent(limit: int = 100, _: str = Depends(require_admin)):
+    """Return the most recent structured log entries."""
+    limit = min(max(limit, 1), 500)
+    return {"entries": structured_logger.get_recent_logs(limit)}
+
+
+@app.get("/logs/errors", tags=["Logs"])
+async def logs_errors(limit: int = 50, _: str = Depends(require_admin)):
+    """Return recent ERROR-level log entries."""
+    limit = min(max(limit, 1), 200)
+    return {"entries": structured_logger.get_error_logs(limit)}
 
 
 # ── Error handling ────────────────────────────────────────────────────────────

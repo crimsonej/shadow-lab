@@ -56,3 +56,40 @@ class HealthResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: Dict[str, Any]     # OpenAI-style: {"message": "...", "type": "..."}
+
+
+# ── Control Plane Extensions ──────────────────────────────────────────────────
+
+class TestModelRequest(BaseModel):
+    name: str                 # Model name, e.g. "llama3:8b"
+    prompt: str = ""          # Custom prompt (empty = use config default)
+
+
+class TestModelResponse(BaseModel):
+    model: str
+    status: str               # "pass" | "fail"
+    response_text: Optional[str] = None
+    latency_ms: float = 0
+    tokens: Optional[Dict[str, int]] = None
+    error: Optional[str] = None
+
+
+class TestApiRequest(BaseModel):
+    model: str                # Which model to use for the API test
+
+
+class TestApiResponse(BaseModel):
+    status: str               # "PASS" | "FAIL"
+    model: str
+    tests: List[Dict[str, Any]]
+    passed_count: int = 0
+    failed_count: int = 0
+    total_latency_ms: float = 0
+
+
+class LifecycleActionRequest(BaseModel):
+    action: str = "restart"   # "restart" | "status"
+
+
+class LogQueryParams(BaseModel):
+    limit: int = Field(default=100, ge=1, le=500)
