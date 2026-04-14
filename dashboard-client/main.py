@@ -145,13 +145,23 @@ if USE_FASTAPI:
         metrics_code, metrics_data = await _proxy_get(server["host"], server["admin_token"], "/admin/metrics")
         models_code, models_data = await _proxy_get(server["host"], server["admin_token"], "/admin/models")
 
-        state = "offline"
+        # Use DB status as baseline
+        state = server.get("status", "OFFLINE").lower()
+        
         if status_code == 200:
             db.update_server_seen(server_id)
+            # If server responds, it must be online (unless it was explicitly told to idle/stop)
+            if state in ["offline", "starting"]:
+                db.update_server_status(server_id, "ONLINE")
+                state = "online"
+            
+            # Refine state if it's idle
             if metrics_data and not metrics_data.get("ollama_running"):
                 state = "idle"
-            else:
-                state = "online"
+        elif state == "online":
+            # Target was supposed to be online but isn't reachable
+            db.update_server_status(server_id, "OFFLINE")
+            state = "offline"
 
         return {
             "online": status_code == 200,
@@ -295,6 +305,20 @@ if USE_FASTAPI:
         )
         return {"deploy_id": deploy_id}
 
+    @app.post("/api/servers/{server_id}/start")
+    async def api_start_server(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        return await system_control.start_server(server)
+
+    @app.post("/api/servers/{server_id}/stop")
+    async def api_stop_server(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        return await system_control.stop_server(server)
+
     @app.get("/api/deploy/status/{deploy_id}")
     async def api_deploy_status(deploy_id: str):
         st = deploy.active_deployments.get(deploy_id)
@@ -311,8 +335,16 @@ if USE_FASTAPI:
             raise HTTPException(404, "Server not found")
         code, data = await _proxy_post(
             server["host"], server["admin_token"],
-            "/admin/test-model", {"name": body.get("name", ""), "prompt": body.get("prompt", "")}
+            "/api/test-model", {"name": body.get("name", ""), "prompt": body.get("prompt", "")}
         )
+        return JSONResponse(content=data, status_code=code)
+
+    @app.get("/api/servers/{server_id}/health")
+    async def api_server_health_detailed(server_id: int):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        code, data = await _proxy_get(server["host"], server["admin_token"], "/api/health")
         return JSONResponse(content=data, status_code=code)
 
     @app.get("/api/servers/{server_id}/models/health")
@@ -688,8 +720,16 @@ else:
         body = request.get_json()
         code, data = _proxy_post(
             server["host"], server["admin_token"],
-            "/admin/test-model", {"name": body.get("name", ""), "prompt": body.get("prompt", "")}
+            "/api/test-model", {"name": body.get("name", ""), "prompt": body.get("prompt", "")}
         )
+        return jsonify(data), code
+
+    @app.route("/api/servers/<int:server_id>/health", methods=["GET"])
+    def api_server_health_detailed(server_id):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+        code, data = _proxy_get(server["host"], server["admin_token"], "/api/health")
         return jsonify(data), code
 
     @app.route("/api/servers/<int:server_id>/models/health", methods=["GET"])

@@ -64,6 +64,7 @@ def init_db() -> None:
         _migrate_add_column(conn, "servers", "ssh_user", "TEXT DEFAULT ''")
         _migrate_add_column(conn, "servers", "ssh_port", "INTEGER DEFAULT 22")
         _migrate_add_column(conn, "servers", "ssh_key_path", "TEXT DEFAULT ''")
+        _migrate_add_column(conn, "servers", "status", "TEXT DEFAULT 'OFFLINE'")
 
 
 # ── Server CRUD ───────────────────────────────────────────────────────────────
@@ -92,6 +93,15 @@ def list_servers() -> List[Dict]:
     with _conn() as conn:
         rows = conn.execute("SELECT * FROM servers ORDER BY id").fetchall()
     return [dict(r) for r in rows]
+
+
+def update_server_status(server_id: int, status: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE servers SET status=? WHERE id=?",
+            (status, server_id),
+        )
+        conn.commit()
 
 
 def update_server_seen(server_id: int) -> None:

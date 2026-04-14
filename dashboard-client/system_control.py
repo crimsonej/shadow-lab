@@ -8,6 +8,8 @@ import ssh_manager
 from compat import command_router
 from compat import os_detector
 import server_lifecycle
+import tunnel_manager
+import db
 
 log = logging.getLogger(__name__)
 
@@ -236,3 +238,89 @@ async def activate_server(server: dict) -> Dict[str, Any]:
         "details": {"message": f"Activated via SSH ({os_info['os']})" if rc == 0 else err},
     }
 
+async def stop_server(server: dict) -> Dict[str, Any]:
+    """
+    Cleanly stop the remote agent and the local tunnel.
+    Transitions: ONLINE -> STOPPING -> OFFLINE
+    """
+    server_id = server["id"]
+    db.update_server_status(server_id, "STOPPING")
+    log.info(f"Stopping server {server_id}...")
+
+    # 1. Try graceful agent shutdown
+    host = server.get("host", "")
+    token = server.get("admin_token", "")
+    try:
+        await server_lifecycle._http_post(host, token, "/api/shutdown")
+        log.info(f"Graceful shutdown signal sent to agent at {host}")
+    except Exception as e:
+        log.warning(f"Could not send graceful shutdown to agent: {e}")
+
+    # 2. Kill local tunnel
+    tunnel_manager.stop_tunnel(server_id)
+    
+    # 3. Update DB
+    db.update_server_status(server_id, "OFFLINE")
+    
+    return {
+        "success": True,
+        "message": "Server stopped and tunnel closed."
+    }
+
+async def start_server(server: dict) -> Dict[str, Any]:
+    """
+    Establish tunnel and start remote agent.
+    Transitions: OFFLINE -> STARTING -> ONLINE
+    """
+    server_id = server["id"]
+    db.update_server_status(server_id, "STARTING")
+    
+    # 1. Establish Tunnel (if SSH info present)
+    ssh_host = server.get("ssh_host")
+    if ssh_host:
+        # Determine local port (simple strategy: 10000 + server_id)
+        local_port = 10000 + server_id
+        # Remote port is usually the agent port from the host URL
+        remote_port = 8080
+        if ":" in server["host"]:
+            try:
+                remote_port = int(server["host"].split(":")[-1].split("/")[0])
+            except: pass
+            
+        success = tunnel_manager.start_tunnel(
+            server_id, 
+            ssh_host, 
+            server.get("ssh_user", "root"),
+            remote_port,
+            local_port,
+            server.get("ssh_key_path")
+        )
+        if not success:
+            db.update_server_status(server_id, "OFFLINE")
+            return {"success": False, "error": "Failed to establish SSH tunnel."}
+        
+        # Update host to use the tunnel for internal calls
+        host_url = f"http://127.0.0.1:{local_port}"
+    else:
+        host_url = server["host"]
+
+    # 2. Start remote agent via SSH
+    ssh = ssh_manager.get_ssh(server)
+    if ssh:
+        os_info = os_detector.detect_os(ssh)
+        cmd = command_router.get_command("start_ai", os_info)
+        ssh.execute(cmd, timeout=15)
+        log.info(f"Start command issued to remote server {server_id}")
+
+    # 3. Wait for heartbeat
+    for _ in range(10):
+        import asyncio
+        await asyncio.sleep(2)
+        token = server.get("admin_token", "")
+        ok, _ = await server_lifecycle._http_get(host_url, token, "/v1/health")
+        if ok:
+            db.update_server_status(server_id, "ONLINE")
+            return {"success": True, "message": "Server is ONLINE"}
+
+    db.update_server_status(server_id, "OFFLINE")
+    return {"success": False, "error": "Agent failed to respond after startup."}

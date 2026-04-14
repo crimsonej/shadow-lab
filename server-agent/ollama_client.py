@@ -19,9 +19,19 @@ def get_client() -> httpx.AsyncClient:
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
             base_url=config.OLLAMA_BASE_URL,
-            timeout=httpx.Timeout(120.0, connect=10.0),
+            timeout=httpx.Timeout(10.0), # Stricter timeout to prevent hanging
         )
     return _client
+
+async def _retry_post(path: str, json_data: Dict[str, Any], timeout: float = 10.0) -> httpx.Response:
+    """Wrapper to try an Ollama POST request with 1x immediate retry on timeout."""
+    import httpx
+    client = get_client()
+    try:
+        return await client.post(path, json=json_data, timeout=timeout)
+    except (httpx.TimeoutException, httpx.ConnectError):
+        # 1 Retry
+        return await client.post(path, json=json_data, timeout=timeout)
 
 
 # ── Model management ──────────────────────────────────────────────────────────
@@ -49,14 +59,39 @@ async def list_models() -> List[Dict[str, Any]]:
 
     return base_models
 
-async def load_model(name: str) -> bool:
-    """Pre-load a model into VRAM by hitting /api/generate with an empty prompt."""
+async def get_loaded_models() -> set[str]:
+    """Helper to return currently loaded model names."""
     try:
-        r = await get_client().post("/api/generate", json={
+        rps = await get_client().get("/api/ps", timeout=5.0)
+        rps.raise_for_status()
+        return {m.get("name") for m in rps.json().get("models", [])}
+    except Exception:
+        return set()
+
+async def load_model(name: str) -> bool:
+    """Pre-load a model into VRAM while strictly enforcing single-model active state."""
+    # Enforce unloading of any previously loaded models according to current state
+    active = config.get_active_model()
+    if active and active != name:
+        await unload_model(active)
+    
+    # Also check if anything else is lingering in VRAM
+    loaded = await get_loaded_models()
+    for mod in loaded:
+        if mod != name:
+            await unload_model(mod)
+
+    try:
+        r = await _retry_post("/api/generate", json_data={
             "model": name,
             "keep_alive": -1  # Load and keep indefinitely until unloaded
-        })
-        return r.status_code == 200
+        }, timeout=15.0)
+        
+        if r.status_code == 200:
+            config.set_active_model(name)
+            config.update_loaded_models([name])
+            return True
+        return False
     except Exception:
         return False
 
@@ -64,13 +99,22 @@ async def load_model(name: str) -> bool:
 async def unload_model(name: str) -> bool:
     """Unload a model from VRAM."""
     try:
-        r = await get_client().post("/api/generate", json={
+        r = await _retry_post("/api/generate", json_data={
             "model": name,
             "keep_alive": 0
-        })
-        return r.status_code == 200
+        }, timeout=5.0)
+        
+        if r.status_code == 200:
+            if config.get_active_model() == name:
+                config.set_active_model("")
+            
+            loaded = [m for m in config.get_loaded_models() if m != name]
+            config.update_loaded_models(loaded)
+            return True
+        return False
     except Exception:
         return False
+
 
 
 async def pull_model(name: str) -> AsyncIterator[str]:
@@ -123,9 +167,12 @@ async def chat_completion(
     if max_tokens:
         payload["options"]["num_predict"] = max_tokens
 
-    r = await get_client().post("/api/chat", json=payload)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = await _retry_post("/api/chat", json_data=payload, timeout=15.0)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Ollama backend failure: {str(e)}")
 
     # Build OpenAI-compatible response
     return {
@@ -172,36 +219,48 @@ async def chat_completion_stream(
         payload["options"]["num_predict"] = max_tokens
 
     chunk_id = f"chatcmpl-stream-{asyncio.get_event_loop().time():.0f}"
+    import httpx
 
-    async with get_client().stream("POST", "/api/chat", json=payload) as resp:
-        resp.raise_for_status()
-        async for line in resp.aiter_lines():
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    try:
+        async with get_client().stream("POST", "/api/chat", json=payload, timeout=httpx.Timeout(15.0, connect=5.0)) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            content = data.get("message", {}).get("content", "")
-            done = data.get("done", False)
+                content = data.get("message", {}).get("content", "")
+                done = data.get("done", False)
 
-            chunk = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": content},
-                        "finish_reason": "stop" if done else None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-            if done:
-                yield "data: [DONE]\n\n"
-                break
+                chunk = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": content},
+                            "finish_reason": "stop" if done else None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                if done:
+                    yield "data: [DONE]\n\n"
+                    break
+    except Exception as e:
+        # Gracefully handle the error by emitting an SSE encoded error string
+        err_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"\n[Backend Error: {str(e)}]"}, "finish_reason": "error"}],
+        }
+        yield f"data: {json.dumps(err_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

@@ -193,3 +193,22 @@ def get_status() -> Dict[str, Any]:
         "processes": state,
         "last_known": stored,
     }
+
+
+def is_ollama_running() -> bool:
+    """Return True if Ollama process is currently alive."""
+    pid = _find_ollama_pid()
+    return _is_pid_alive(pid) if pid else False
+
+
+def restart_ollama() -> Dict[str, Any]:
+    """Surgically restart the Ollama process."""
+    kill_result = kill_ollama()
+    import time
+    time.sleep(1.0)
+    start_result = start_ollama()
+    return {
+        "kill_success": kill_result.get("success", False),
+        "start_success": start_result.get("success", False),
+        "success": start_result.get("success", False)
+    }

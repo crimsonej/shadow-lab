@@ -73,6 +73,9 @@
   .badge-online { background: rgba(16,185,129,.15); color: var(--success); }
   .badge-offline { background: rgba(239,68,68,.15); color: var(--danger); }
   .badge-warn { background: rgba(245,158,11,.15); color: var(--warn); }
+  .badge-starting { background: rgba(108,99,255,.15); color: var(--accent); }
+  .badge-stopping { background: rgba(239,68,68,.15); color: var(--danger); animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
 
   /* Buttons */
   .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
@@ -321,6 +324,17 @@
           <div class="section-title">Model & API Testing</div>
         </div>
 
+        <!-- New Environment Health Section -->
+        <div class="card" style="margin-bottom:20px; border-left: 4px solid var(--accent);">
+          <div class="card-title" style="display:flex; align-items:center; gap:8px;">
+            🛡️ Reliability & Environment Health
+            <button class="btn btn-secondary btn-sm" onclick="loadTestingTab()" style="margin-left:auto; padding:2px 8px;">Refresh Health</button>
+          </div>
+          <div id="test-environment-health" style="margin-top:12px; font-size:13px; color:var(--muted)">
+            Loading environment status...
+          </div>
+        </div>
+
         <div class="grid-2" style="margin-bottom:20px">
           <div class="card">
             <div class="card-title">Model Health Check</div>
@@ -361,17 +375,22 @@
         <div class="section-header">
           <div class="section-title">Server Lifecycle Control</div>
         </div>
-        <!-- Primary: Activate / Deactivate -->
-        <div class="cp-grid cp-grid-2" style="margin-bottom:16px; row-gap:16px;">
-          <div class="lifecycle-btn" id="btn-activate" onclick="lifecycleAction('activate')" style="border-left:3px solid var(--success);">
-            <div class="lc-icon">🟢</div>
-            <div class="lc-label">Activate Server</div>
-            <div class="lc-sub">Start Ollama engine &amp; verify health</div>
+        <!-- Primary: Start / Stop / Deactivate -->
+        <div class="cp-grid cp-grid-3" style="margin-bottom:16px; row-gap:16px;">
+          <div class="lifecycle-btn" id="btn-start-server" onclick="lifecycleAction('start-server')" style="border-left:3px solid var(--success);">
+            <div class="lc-icon">🚀</div>
+            <div class="lc-label">Start Server</div>
+            <div class="lc-sub">Establish tunnel & start agent</div>
           </div>
-          <div class="lifecycle-btn" id="btn-deactivate" onclick="confirmSystemAction('deactivate', 'Deactivate server? This will stop Ollama and free all ports.')" style="border-left:3px solid var(--danger);">
+          <div class="lifecycle-btn" id="btn-stop-server" onclick="confirmSystemAction('stop-server', 'Stop server? This will shut down the agent and close the tunnel.')" style="border-left:3px solid var(--danger);">
+            <div class="lc-icon">🛑</div>
+            <div class="lc-label">Stop Server</div>
+            <div class="lc-sub">Full shutdown & tunnel closure</div>
+          </div>
+          <div class="lifecycle-btn" id="btn-deactivate" onclick="confirmSystemAction('deactivate', 'Deactivate AI? This will stop Ollama process but keep agent alive.')" style="border-left:3px solid var(--warn);">
             <div class="lc-icon">🔴</div>
-            <div class="lc-label">Deactivate Server</div>
-            <div class="lc-sub">Stop Ollama, kill model processes, free ports</div>
+            <div class="lc-label">Deactivate AI</div>
+            <div class="lc-sub">Stop Ollama only, agent stays up</div>
           </div>
         </div>
 
@@ -703,6 +722,22 @@ const fmtBytes = b => {
 const fmtDate = s => s ? new Date(s).toLocaleDateString()+' '+new Date(s).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—';
 const truncateKey = k => k ? k.slice(0,12)+'…'+k.slice(-4) : '—';
 
+function buildStatusBadge(state, online) {
+  state = (state || 'offline').toLowerCase();
+  let cls = 'badge-offline', label = state.toUpperCase();
+  if (state === 'online' || (state === 'idle' && online)) {
+    if (state === 'online') { cls = 'badge-online'; label = '● ONLINE'; }
+    else { cls = 'badge-warn'; label = '💤 IDLE'; }
+  } else if (state === 'starting') {
+    cls = 'badge-starting'; label = '🚀 STARTING';
+  } else if (state === 'stopping') {
+    cls = 'badge-stopping'; label = '🛑 STOPPING';
+  } else {
+    cls = 'badge-offline'; label = '● OFFLINE';
+  }
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
 async function apiFetch(path, opts={}) {
   const r = await fetch(API+path, {
     headers: {'Content-Type':'application/json', ...(opts.headers||{})},
@@ -786,9 +821,7 @@ async function loadOverview() {
 }
 
 function buildServerCard(s, st) {
-  const badge = st.online
-    ? `<span class="badge badge-online">● Online</span>`
-    : `<span class="badge badge-offline">● Offline</span>`;
+  const badge = buildStatusBadge(st.state, st.online);
   const m = st.metrics || {};
   const cpu = m.cpu_percent ?? 0;
   const ram = m.ram ?? {};
@@ -835,8 +868,10 @@ function buildServerCard(s, st) {
 function buildSidebarServerList(servers, statuses) {
   $('server-nav-list').innerHTML = servers.map((s,i)=>{
     const online = statuses[i]?.online;
+    const state = (statuses[i]?.state || 'offline').toLowerCase();
+    const dotCls = online ? 'online' : (state === 'starting' ? 'starting' : 'offline');
     return `<div class="server-nav-item ${currentServerId===s.id?'active':''}" onclick="openServerDetail(${s.id})">
-      <div class="dot ${online?'online':'offline'}"></div>
+      <div class="dot ${dotCls}"></div>
       <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</div>
     </div>`;
   }).join('') || '<div style="padding:10px 14px;font-size:12px;color:var(--muted)">No servers</div>';
@@ -860,10 +895,7 @@ async function loadServerDetail(id) {
   const st = await apiFetch(`/api/servers/${id}/status`).catch(()=>({online:false,state:'offline',metrics:null,models:[]}));
   serverStatuses[id] = st;
 
-  let badgeHtml = '';
-  if(st.state === 'idle') badgeHtml = '<span class="badge badge-warn">💤 Idle</span>';
-  else if(st.online) badgeHtml = '<span class="badge badge-online">● Online</span>';
-  else badgeHtml = '<span class="badge badge-offline">● Offline</span>';
+  let badgeHtml = buildStatusBadge(st.state, st.online);
 
   let activeModelName = null;
   (st.models||[]).forEach(m => { if(m.active) activeModelName = m.name; });
@@ -885,6 +917,7 @@ async function loadServerDetail(id) {
   renderModelsTable(st.models || []);
 
   if(currentTab==='keys') loadKeys(id);
+  if(currentTab==='testing') loadTestingTab();
 }
 
 function renderMetricCards(m) {
@@ -1140,23 +1173,66 @@ async function runSingleModelTest() {
   const name = $('test-model-name').value.trim();
   if(!name) { toast('Enter a model name','error'); return; }
   const prompt = $('test-model-prompt').value.trim();
-  $('single-model-result').innerHTML = '<div class="spin" style="margin:8px 0"></div>';
+  $('single-model-result').innerHTML = '<div class="spin" style="margin:8px 0"></div> Testing...';
   try {
-    const data = await apiFetch(`/api/servers/${currentServerId}/test-model`, {
+    const data = await apiFetch(`/api/servers/${currentServerId}/proxy/api/test-model`, {
       method:'POST', body:{name, prompt}
     });
-    const ok = data.status==='pass';
+    const ok = data.status === 'pass';
     $('single-model-result').innerHTML = `
       <div class="test-result ${ok?'test-pass':'test-fail'}">
         <span>${ok?'✓':'✗'}</span>
-        <span class="mono">${data.model}</span>
+        <strong class="mono">${data.model}</strong>
         <span style="margin-left:12px;font-size:12px">${data.latency_ms}ms</span>
         ${data.tokens?`<span style="font-size:11px;color:var(--muted);margin-left:8px">${data.tokens.total} tokens</span>`:''}
       </div>
-      ${data.response_text?`<div style="margin-top:8px;padding:10px;background:var(--bg3);border-radius:6px;font-size:12px;color:var(--muted)"><strong>Response:</strong> ${data.response_text.substring(0,200)}</div>`:''}
-      ${data.error?`<div style="margin-top:8px;color:var(--danger);font-size:12px">${data.error}</div>`:''}
+      ${data.response_text?`<div style="margin-top:8px;padding:12px;background:var(--bg3);border-radius:8px;font-size:13px;color:var(--text);border:1px solid var(--border);line-height:1.4"><strong>Ollama Response:</strong><br>${data.response_text}</div>`:''}
+      ${data.error?`<div style="margin-top:8px;color:var(--danger);font-size:12px;background:rgba(239,68,68,0.1);padding:8px;border-radius:4px;border:1px solid rgba(239,68,68,0.2)">${data.error}</div>`:''}
     `;
+    loadTestingTab(); // update health
   } catch(e) { $('single-model-result').innerHTML = `<span style="color:var(--danger)">${e.message}</span>`; }
+}
+
+async function loadTestingTab() {
+  const el = $('test-environment-health');
+  if(!el) return;
+  try {
+    // Fetch detailed ollama health which we just added
+    const health = await apiFetch(`/api/servers/${currentServerId}/proxy/api/ollama-health`);
+    const s = serverStatuses[currentServerId];
+    
+    let html = `
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <div style="display:flex; gap:24px; flex-wrap:wrap; align-items:center;">
+          <div><label style="margin-bottom:2px">Status</label>${buildStatusBadge(s.state, s.online)}</div>
+          <div><label style="margin-bottom:2px">Runtime</label> <span style="color:${health.status==='online'?'var(--success)':'var(--danger)'}">● ${health.status.toUpperCase()}</span></div>
+          <div><label style="margin-bottom:2px">Active Model</label> <span class="mono" style="color:var(--accent2); font-weight:700;">${health.active_model || 'None'}</span></div>
+        </div>
+        <div style="padding:14px; background:var(--bg3); border:1px solid var(--border); border-radius:10px;">
+          <div style="font-weight:600; margin-bottom:10px; font-size:13px; color:var(--muted); display:flex; align-items:center; gap:8px;">
+            💎 Loaded in VRAM:
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:8px;">
+            ${(health.loaded_models || []).length ? health.loaded_models.map(m => `
+              <div class="model-pill" style="border-color:var(--accent); background:rgba(108,99,255,0.1);">
+                ${m} 
+                <button class="btn btn-secondary" style="padding:0 5px; font-size:10px; height:20px; border:none; background:var(--bg3);" onclick="quickTest('${m}')">Test</button>
+              </div>
+            `).join('') : '<span style="color:var(--muted); font-size:12px;">No models currently resident in GPU memory.</span>'}
+          </div>
+        </div>
+      </div>
+    `;
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--danger)">Ready to check... (Issue: ${e.message})</span>`;
+  }
+}
+
+function quickTest(name) {
+  $('tab-testing').scrollIntoView();
+  $('test-model-name').value = name;
+  runSingleModelTest();
 }
 
 // ── API Key Testing ────────────────────────────────────────────────────────────
@@ -1177,26 +1253,29 @@ async function testApiKey(key, label) {
 // ── Control Plane: Lifecycle ──────────────────────────────────────────────────
 
 async function lifecycleAction(action) {
-  const labels = {
-    'activate': 'Activating Server',
-    'deactivate': 'Deactivating Server',
-    'restart-ai': 'Restarting AI',
-    'idle': 'Entering Idle Mode',
-    'restart-ollama': 'Restarting Ollama',
-  };
-  const label = labels[action] || action;
-  if(!confirm(`${label}?`)) return;
-  toast(`${label}...`, 'info');
+  const s = currentServerId;
+  toast(`Action ${action} issued...`, 'info');
+  
+  let path = `/admin/lifecycle/${action}`;
+  if(action==='activate') path = `/admin/activate`;
+  if(action==='deactivate') path = `/admin/deactivate`;
+  
+  // New lifecycle routes
+  if(action==='start-server') path = `/api/servers/${s}/start`;
+  if(action==='stop-server') path = `/api/servers/${s}/stop`;
+  
   try {
-    const data = await apiFetch(`/api/servers/${currentServerId}/lifecycle/${action}`, {method:'POST'});
-    if(data.success !== false) {
-      toast(`${label}: Success (${data.method || 'agent'})`, 'success');
-    } else {
-      toast(`${label} Failed: ${data.details?.error || data.message || 'Unknown error'}`, 'error');
-    }
-    setTimeout(loadLifecycleStatus, 2000);
-    setTimeout(() => loadServerDetail(currentServerId), 3000);
-  } catch(e) { toast(e.message, 'error'); }
+    const data = await apiFetch(path.startsWith('/api/') ? path : `/api/servers/${s}/proxy${path}`, {
+      method: 'POST'
+    });
+    toast(data.message || 'Action completed', 'success');
+    setTimeout(() => {
+        loadServerDetail(s);
+        if(action==='stop-server') showView('overview');
+    }, 1500);
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 
 async function confirmSystemAction(action, msg) {
@@ -1323,14 +1402,10 @@ async function loadServersTable() {
   servers.forEach(s=>{
     apiFetch(`/api/servers/${s.id}/status`).then(st=>{
       const el = $(`srv-status-${s.id}`);
-      if(el) {
-        if(st.state === 'idle') el.innerHTML = '<span class="badge badge-warn">💤 Idle</span>';
-        else if(st.online) el.innerHTML = '<span class="badge badge-online">● Online</span>';
-        else el.innerHTML = '<span class="badge badge-offline">● Offline</span>';
-      }
+      if(el) el.innerHTML = buildStatusBadge(st.state, st.online);
     }).catch(()=>{
       const el = $(`srv-status-${s.id}`);
-      if(el) el.innerHTML = `<span class="badge badge-offline">● Offline</span>`;
+      if(el) el.innerHTML = buildStatusBadge('offline', false);
     });
   });
 }

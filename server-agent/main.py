@@ -22,6 +22,9 @@ Endpoints
 
 import asyncio
 import logging
+import time
+import sys
+import threading
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -94,6 +97,27 @@ app.add_middleware(
 # Structured request logging middleware
 app.add_middleware(structured_logger.RequestIdMiddleware)
 
+
+# Global Exception Handler to prevent process death
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    slog = structured_logger.get_logger()
+    request_id = getattr(request.state, "request_id", "unknown")
+    slog.error(
+        f"CRITICAL: Unhandled exception on {request.method} {request.url.path}",
+        request_id=request_id,
+        error=str(exc)
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "message": f"An unexpected error occurred in the agent: {str(exc)}",
+                "type": "internal_error",
+                "request_id": request_id
+            }
+        }
+    )
 
 # ── Dependency: validate API key ──────────────────────────────────────────────
 
@@ -376,6 +400,113 @@ async def admin_unload_model(body: schemas.LoadModelRequest, _: str = Depends(re
     if not success:
         raise HTTPException(500, "Failed to unload model in Ollama.")
     return {"status": "ok", "message": f"Model {body.model} unloaded."}
+
+# ── Public Reliability API ───────────────────────────────────────────────────
+
+@app.get("/api/health", tags=["Reliability"])
+async def api_health():
+    """Consolidated health check: agent, ollama status, and model state."""
+    ollama_ok = await ollama_client.ping_ollama()
+    loaded_models = []
+    try:
+        loaded_models = list(await ollama_client.get_loaded_models())
+    except Exception:
+        pass
+
+    return {
+        "agent": "online",
+        "ollama": "online" if ollama_ok else "offline",
+        "active_model": config.get_active_model() or None,
+        "models_loaded": loaded_models,
+        "uptime": uptime_tracker.get_uptime(),
+        "errors": structured_logger.get_error_logs(limit=5)
+    }
+
+
+@app.post("/api/test-model", tags=["Reliability"])
+async def api_test_model(body: schemas.TestModelRequest):
+    """Verify if a model is callable with a strict 10s timeout, using standardized test logic."""
+    # Ensure model is "active" or load it temporarily? 
+    # The prompt says: "Ensure model is loaded"
+    active = config.get_active_model()
+    if active != body.name:
+        log.info(f"Test requested for non-active model {body.name}. Loading now...")
+        # This will trigger our single-model load logic
+        await ollama_client.load_model(body.name)
+    
+    # Use the model_tester logic to get a standardized response
+    # We wrap it in a try-except to guarantee it never crashes the server
+    try:
+        result = await asyncio.wait_for(
+            model_tester.test_model(
+                model_name=body.name,
+                prompt=body.prompt or "Say OK if working."
+            ),
+            timeout=12.0 # 10s target + 2s buffer
+        )
+        return result
+    except asyncio.TimeoutError:
+        return {
+            "model": body.name,
+            "status": "fail",
+            "error": "Inference timed out after 10 seconds",
+            "latency_ms": 10000.0
+        }
+    except Exception as e:
+        return {
+            "model": body.name,
+            "status": "fail",
+            "error": str(e),
+            "latency_ms": 0
+        }
+
+
+@app.get("/api/ollama-health", tags=["Reliability"])
+async def api_ollama_health():
+    """Detailed health check for the Ollama runtime."""
+    ollama_ok = await ollama_client.ping_ollama()
+    active_model = config.get_active_model()
+    
+    loaded_models = []
+    try:
+        loaded_models = list(await ollama_client.get_loaded_models())
+    except Exception:
+        pass
+
+    installed_models = []
+    try:
+        tags = await ollama_client.list_models()
+        installed_models = [m["name"] for m in tags]
+    except Exception:
+        pass
+
+    return {
+        "status": "online" if ollama_ok else "offline",
+        "active_model": active_model or None,
+        "loaded_models": loaded_models,
+        "installed_models": installed_models,
+        "gpu_usage": None, # Future: integrate GPU metrics if available
+        "latency": None
+    }
+
+
+@app.post("/api/shutdown", tags=["Control"])
+async def api_shutdown(_: str = Depends(require_admin)):
+    """Gracefully stop the agent process."""
+    log.info("SHUTDOWN request received via API. Terminating in 1 second...")
+    
+    def delayed_exit():
+        time.sleep(1)
+        log.info("Agent process exiting now.")
+        sys.exit(0)
+    
+    threading.Thread(target=delayed_exit, daemon=True).start()
+    
+    return {
+        "status": "stopping",
+        "message": "Agent is shutting down cleanly. Local tunnel will be disconnected."
+    }
+
 
 # ── Control Plane: API Integrity Testing ──────────────────────────────────────
 

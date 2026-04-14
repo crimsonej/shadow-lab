@@ -4,6 +4,7 @@ config.py — Runtime configuration loaded from environment variables.
 import os
 import secrets
 from pathlib import Path
+from typing import Optional
 
 # Where Ollama listens locally on the server
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
@@ -62,22 +63,60 @@ def ensure_admin_token() -> str:
     return ADMIN_TOKEN
 
 
-# ── Active Model State Persistence ────────────────────────────────────────────
+# ── Active Model & Lifecycle State Persistence ────────────────────────────────
+import json
+import time
 
-ACTIVE_MODEL_FILE = DATA_DIR / "active_model.txt"
+STATE_FILE = DATA_DIR / "state.json"
+_STATE_CACHE: Optional[dict] = None
 
-def get_active_model() -> str:
-    """Read the currently active model from disk, or empty string if none."""
-    if ACTIVE_MODEL_FILE.exists():
+def _load_state() -> dict:
+    global _STATE_CACHE
+    if _STATE_CACHE is not None:
+        return _STATE_CACHE
+
+    if STATE_FILE.exists():
         try:
-            return ACTIVE_MODEL_FILE.read_text().strip()
-        except IOError:
+            _STATE_CACHE = json.loads(STATE_FILE.read_text())
+            return _STATE_CACHE
+        except (IOError, json.JSONDecodeError):
             pass
-    return ""
+    
+    _STATE_CACHE = {
+        "active_model": "",
+        "loaded_models": [],
+        "last_switch": 0
+    }
+    return _STATE_CACHE
 
-def set_active_model(model: str):
-    """Save the active model to disk."""
+def _save_state(state: dict):
+    global _STATE_CACHE
     try:
-        ACTIVE_MODEL_FILE.write_text(model)
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+        _STATE_CACHE = state
     except IOError:
         pass
+
+def get_active_model() -> str:
+    """Read the currently active model from persistent JSON state."""
+    state = _load_state()
+    return state.get("active_model", "")
+
+def set_active_model(model: str):
+    """Save the active model to JSON state and update tracking."""
+    state = _load_state()
+    state["active_model"] = model
+    state["last_switch"] = time.time()
+    _save_state(state)
+
+def get_loaded_models() -> list:
+    """Return the list of models we consider 'loaded' according to state.json."""
+    state = _load_state()
+    return state.get("loaded_models", [])
+
+def update_loaded_models(models: list):
+    """Update the set of models recorded as loaded in VRAM."""
+    state = _load_state()
+    state["loaded_models"] = models
+    _save_state(state)
+
