@@ -463,7 +463,41 @@ if USE_FASTAPI:
         if not server:
             raise HTTPException(404, "Server not found")
         report = compatibility.full_compatibility_report(server)
-        return report
+    @app.api_route("/api/servers/{server_id}/proxy/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+    async def api_generic_proxy(server_id: int, path: str, request: Request):
+        server = db.get_server(server_id)
+        if not server:
+            raise HTTPException(404, "Server not found")
+        
+        # Prepare the target URL with query params
+        query = str(request.query_params)
+        full_path = f"/{path}"
+        if query:
+            full_path += f"?{query}"
+            
+        method = request.method
+        body = None
+        if method in ["POST", "PUT", "PATCH", "DELETE"]:
+            try:
+                body = await request.json()
+            except:
+                pass
+
+        if method == "GET":
+            code, data = await _proxy_get(server["host"], server["admin_token"], full_path)
+        elif method == "POST":
+            code, data = await _proxy_post(server["host"], server["admin_token"], full_path, body)
+        elif method == "DELETE":
+            code, data = await _proxy_delete(server["host"], server["admin_token"], full_path, body)
+        else:
+            # Fallback for other methods using _proxy_post as template
+            try:
+                r = await _http.request(method, f"{server['host']}{full_path}", json=body, headers=_agent_headers(server["admin_token"]))
+                code, data = r.status_code, r.json()
+            except Exception as e:
+                code, data = 500, {"error": str(e)}
+        
+        return JSONResponse(content=data, status_code=code)
 
 else:
     # ── Flask Fallback Implementation ──────────────────────────────────────────
@@ -842,6 +876,34 @@ else:
             return jsonify({"detail": "Server not found"}), 404
         report = compatibility.full_compatibility_report(server)
         return jsonify(report)
+
+    @app.route("/api/servers/<int:server_id>/proxy/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
+    def api_generic_proxy(server_id, path):
+        server = db.get_server(server_id)
+        if not server:
+            return jsonify({"detail": "Server not found"}), 404
+            
+        full_path = f"/{path}"
+        if request.query_string:
+            full_path += f"?{request.query_string.decode('utf-8')}"
+            
+        method = request.method
+        body = request.get_json(silent=True)
+        
+        if method == "GET":
+            code, data = _proxy_get(server["host"], server["admin_token"], full_path)
+        elif method == "POST":
+            code, data = _proxy_post(server["host"], server["admin_token"], full_path, body)
+        elif method == "DELETE":
+            code, data = _proxy_delete(server["host"], server["admin_token"], full_path, body)
+        else:
+            try:
+                r = requests.request(method, f"{server['host']}{full_path}", json=body, headers=_agent_headers(server["admin_token"]), timeout=30)
+                code, data = r.status_code, r.json()
+            except Exception as e:
+                code, data = 500, {"error": str(e)}
+                
+        return jsonify(data), code
 
 
 if __name__ == "__main__":

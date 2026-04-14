@@ -123,11 +123,16 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 def get_api_key(authorization: str = Header(...)):
     """
-    Expect header:  Authorization: Bearer sk-xxxx
+    Expect header:  Authorization: Bearer sk-xxxx OR admin-token
     """
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header must be 'Bearer <key>'")
     key = authorization.split(" ", 1)[1].strip()
+    
+    # Allow admin token to bypass key check for dashboard proxying
+    if key == config.ensure_admin_token():
+        return "admin"
+        
     record = auth.validate_key(key)
     if record is None:
         raise HTTPException(status_code=401, detail="Invalid or disabled API key")
@@ -424,7 +429,7 @@ async def api_health():
 
 
 @app.post("/api/test-model", tags=["Reliability"])
-async def api_test_model(body: schemas.TestModelRequest):
+async def api_test_model(body: schemas.TestModelRequest, _: str = Depends(require_admin)):
     """Verify if a model is callable with a strict 10s timeout, using standardized test logic."""
     # Ensure model is "active" or load it temporarily? 
     # The prompt says: "Ensure model is loaded"
@@ -462,7 +467,7 @@ async def api_test_model(body: schemas.TestModelRequest):
 
 
 @app.get("/api/ollama-health", tags=["Reliability"])
-async def api_ollama_health():
+async def api_ollama_health(_: str = Depends(require_admin)):
     """Detailed health check for the Ollama runtime."""
     ollama_ok = await ollama_client.ping_ollama()
     active_model = config.get_active_model()
