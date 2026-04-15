@@ -64,7 +64,9 @@ if USE_FASTAPI:
     app = FastAPI(title="Shadow-Lab Control Plane", docs_url="/api/docs")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-    _http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0))
+    # Refined for Provider-Grade Reliability: 10m timeout, 100 max connections
+    _limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    _http = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0), limits=_limits)
 
     async def _proxy_get(host: str, token: str, path: str):
         try:
@@ -77,6 +79,18 @@ if USE_FASTAPI:
 
     async def _proxy_post(host: str, token: str, path: str, body: dict):
         try:
+            # Check if this is a chat completion that should be streamed
+            is_chat = "/v1/chat/completions" in path or "/api/generate" in path
+            if is_chat and body.get("stream"):
+                # Handle streaming proxy logic (FastAPI)
+                from fastapi.responses import StreamingResponse
+                async def stream_gen():
+                    async with _http.stream("POST", f"{host}{path}", json=body, headers=_agent_headers(token), timeout=600.0) as r:
+                        async for line in r.aiter_lines():
+                            if line:
+                                yield f"{line}\n"
+                return StreamingResponse(stream_gen(), media_type="text/event-stream")
+
             r = await _http.post(f"{host}{path}", json=body, headers=_agent_headers(token))
             return r.status_code, r.json()
         except httpx.ConnectError:
@@ -485,19 +499,25 @@ if USE_FASTAPI:
                 pass
 
         if method == "GET":
-            code, data = await _proxy_get(server["host"], server["admin_token"], full_path)
+            res = await _proxy_get(server["host"], server["admin_token"], full_path)
         elif method == "POST":
-            code, data = await _proxy_post(server["host"], server["admin_token"], full_path, body)
+            res = await _proxy_post(server["host"], server["admin_token"], full_path, body)
         elif method == "DELETE":
-            code, data = await _proxy_delete(server["host"], server["admin_token"], full_path, body)
+            res = await _proxy_delete(server["host"], server["admin_token"], full_path, body)
         else:
-            # Fallback for other methods using _proxy_post as template
+            # Fallback for other methods
             try:
                 r = await _http.request(method, f"{server['host']}{full_path}", json=body, headers=_agent_headers(server["admin_token"]))
-                code, data = r.status_code, r.json()
+                res = (r.status_code, r.json())
             except Exception as e:
-                code, data = 500, {"error": str(e)}
+                res = (500, {"error": str(e)})
         
+        # If it's a direct FastAPI response (e.g. Streaming), return it
+        from fastapi.responses import Response as FAResponse
+        if isinstance(res, FAResponse):
+            return res
+            
+        code, data = res
         return JSONResponse(content=data, status_code=code)
 
 else:
@@ -510,7 +530,7 @@ else:
 
     def _proxy_get(host: str, token: str, path: str):
         try:
-            r = requests.get(f"{host}{path}", headers=_agent_headers(token), timeout=15)
+            r = requests.get(f"{host}{path}", headers=_agent_headers(token), timeout=600)
             try:
                 return r.status_code, r.json()
             except ValueError:
@@ -522,7 +542,18 @@ else:
 
     def _proxy_post(host: str, token: str, path: str, body: dict):
         try:
-            r = requests.post(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=120)
+            # Check for streaming inference
+            is_chat = "/v1/chat/completions" in path or "/api/generate" in path
+            if is_chat and body.get("stream"):
+                from flask import Response
+                r = requests.post(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=600, stream=True)
+                def generate():
+                    for line in r.iter_lines():
+                        if line:
+                            yield f"{line.decode('utf-8')}\n"
+                return Response(generate(), mimetype='text/event-stream')
+
+            r = requests.post(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=600)
             try:
                 return r.status_code, r.json()
             except ValueError:
@@ -534,7 +565,7 @@ else:
 
     def _proxy_delete(host: str, token: str, path: str, body: dict):
         try:
-            r = requests.delete(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=15)
+            r = requests.delete(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=600)
             try:
                 return r.status_code, r.json()
             except ValueError:
@@ -897,18 +928,24 @@ else:
         body = request.get_json(silent=True)
         
         if method == "GET":
-            code, data = _proxy_get(server["host"], server["admin_token"], full_path)
+            res = _proxy_get(server["host"], server["admin_token"], full_path)
         elif method == "POST":
-            code, data = _proxy_post(server["host"], server["admin_token"], full_path, body)
+            res = _proxy_post(server["host"], server["admin_token"], full_path, body)
         elif method == "DELETE":
-            code, data = _proxy_delete(server["host"], server["admin_token"], full_path, body)
+            res = _proxy_delete(server["host"], server["admin_token"], full_path, body)
         else:
             try:
-                r = requests.request(method, f"{server['host']}{full_path}", json=body, headers=_agent_headers(server["admin_token"]), timeout=30)
-                code, data = r.status_code, r.json()
+                r = requests.request(method, f"{server['host']}{full_path}", json=body, headers=_agent_headers(server["admin_token"]), timeout=600)
+                res = (r.status_code, r.json())
             except Exception as e:
-                code, data = 500, {"error": str(e)}
+                res = (500, {"error": str(e)})
                 
+        # Handle flask direct response (e.g. Streaming)
+        from flask import Response as FlaskResponse
+        if isinstance(res, FlaskResponse):
+            return res
+            
+        code, data = res
         return jsonify(data), code
 
 

@@ -1236,30 +1236,65 @@ async function sendChatMessage() {
   input.value = '';
   
   const historyEl = $('chat-history');
-  const loadingMsg = document.createElement('div');
-  loadingMsg.style.color = 'var(--muted)';
-  loadingMsg.innerHTML = '<span class="spin" style="width:12px;height:12px;display:inline-block"></span> Assistant is thinking...';
-  historyEl.appendChild(loadingMsg);
+  
+  // Create placeholder for assistant response
+  const assistantMsgIndex = chatMessages.length;
+  chatMessages.push({role:'assistant', content:''});
+  renderChat();
+  
+  const assistantEl = historyEl.lastElementChild.querySelector('div[style*="background: var(--bg3)"]');
+  assistantEl.innerHTML = '<span class="spin" style="width:12px;height:12px;display:inline-block"></span> Thinking...';
   historyEl.scrollTop = historyEl.scrollHeight;
 
   try {
-    const data = await apiFetch(`/api/servers/${currentServerId}/proxy/v1/chat/completions`, {
-      method:'POST', body:{model, messages:chatMessages}
+    const response = await fetch(API + `/api/servers/${currentServerId}/proxy/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: chatMessages.slice(0, -1), // send all except the empty assistant placeholder
+        stream: true
+      })
     });
-    
-    // Remove loading
-    historyEl.removeChild(loadingMsg);
 
-    if(data.choices && data.choices[0]) {
-      const resp = data.choices[0].message;
-      chatMessages.push(resp);
-      renderChat();
-    } else if(data.error) {
-       throw new Error(data.error.message || data.error);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || err.error || 'Connection failed');
     }
-  } catch(e) {
-    historyEl.removeChild(loadingMsg);
-    toast(e.message, 'error');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let assistantContent = '';
+    assistantEl.innerHTML = ''; // clear loading
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (!line.trim() || line.includes('[DONE]')) continue;
+        
+        try {
+          const jsonStr = line.replace(/^data:\s*/, '');
+          const data = JSON.parse(jsonStr);
+          if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
+            assistantContent += data.choices[0].delta.content;
+            chatMessages[assistantMsgIndex].content = assistantContent;
+            // Incremental Update
+            assistantEl.innerHTML = assistantContent.replace(/\n/g, '<br>');
+            historyEl.scrollTop = historyEl.scrollHeight;
+          }
+        } catch (e) {
+          // Some chunks might be incomplete or metadata
+        }
+      }
+    }
+  } catch (e) {
+    toast(`Bridge Error: ${e.message}`, 'error');
+    assistantEl.innerHTML = `<span style="color:var(--danger)">Error: ${e.message}</span>`;
     console.error(e);
   }
 }
