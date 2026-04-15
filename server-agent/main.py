@@ -43,6 +43,7 @@ import api_tester
 import uptime_tracker
 import structured_logger
 import process_tracker
+import execution_controller
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -68,6 +69,9 @@ async def lifespan(app: FastAPI):
         log.info("Ollama is reachable ✓")
     else:
         log.warning("Ollama is NOT reachable — requests will fail until it starts")
+    # Start the background execution controller
+    execution_controller.controller.start()
+    
     # Record boot for uptime tracking
     uptime_tracker.record_boot()
     yield
@@ -186,6 +190,43 @@ async def list_models(api_key: str = Depends(get_api_key)):
     return {"object": "list", "data": data}
 
 
+# ── Execution Control ──────────────────────────────────────────────────────────
+
+@app.get("/api/request/{request_id}", tags=["Inference"])
+async def get_request_status(request_id: str, _: str = Depends(get_api_key)):
+    """Fetch status and result of a queued or completed request (Step 5)."""
+    task = execution_controller.controller.get_status(request_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Request not found")
+    
+    return {
+        "id": task.id,
+        "status": task.status,
+        "model": task.model,
+        "latency_ms": round(task.latency_ms, 2),
+        "error": task.error,
+        "response": task.response if task.status == "completed" else None
+    }
+
+
+@app.post("/api/cancel/{request_id}", tags=["Inference"])
+async def cancel_request(request_id: str, _: str = Depends(get_api_key)):
+    """Terminate a pending or running request (Step 3)."""
+    success = await execution_controller.controller.cancel_request(request_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Could not cancel (finished or not found)")
+    return {"status": "success", "message": f"Request {request_id} cancelled"}
+
+
+@app.get("/api/queue/len", tags=["Admin"])
+async def get_queue_info(_: str = Depends(require_admin)):
+    """Admin endpoint to see current queue depth."""
+    return {
+        "queue_size": execution_controller.controller._queue.qsize(),
+        "active_request_ids": list(execution_controller.controller._active_tasks.keys())
+    }
+
+
 # Global counter for active inference requests
 ACTIVE_REQUESTS = 0
 
@@ -204,33 +245,64 @@ async def chat_completions(
     try:
         messages = [m.model_dump() for m in body.messages]
 
-        async with _semaphore:
+        # Step 1: Add to Queue
+        try:
+            task = await execution_controller.controller.add_request(
+                model=body.model,
+                messages=messages,
+                temperature=body.temperature,
+                stream=body.stream
+            )
+        except RuntimeError as e:
+            if "server_busy" in str(e):
+                raise HTTPException(status_code=503, detail="Server busy (queue full)")
+            raise e
+
+        # Step 2: Wait for our Turn
+        try:
+            await task.is_ready.wait()
+            
+            # Double check we haven't been cancelled while waiting
+            if task.status == "cancelled":
+                raise HTTPException(status_code=499, detail="Request cancelled while in queue")
+
             if body.stream:
                 async def event_stream() -> AsyncIterator[bytes]:
                     prompt_tokens = 0
                     completion_tokens = 0
                     try:
-                        async for chunk in ollama_client.handle_chat_stream_request(
+                        # Register the actual inference task for cancellation
+                        stream_gen = ollama_client.handle_chat_stream_request(
                             messages=messages,
                             model=body.model,
                             temperature=body.temperature,
-                        ):
+                        )
+                        async for chunk in stream_gen:
                             yield chunk.encode()
                             completion_tokens += 1
                     except Exception as e:
                         log.error(f"Streaming error: {e}")
                     finally:
                         auth.record_usage(api_key, tokens_in=prompt_tokens, tokens_out=completion_tokens)
+                        task.is_done.set()
                         ACTIVE_REQUESTS -= 1
 
+                # We can't easily register 'event_stream' itself as a task since it's a generator
+                # but handle_chat_stream_request handles it internally.
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
             else:
+                # Wrap inference in a task to allow registration/cancellation
+                inference_coro = ollama_client.handle_chat_request(
+                    messages=messages,
+                    model=body.model,
+                    temperature=body.temperature,
+                )
+                inference_task = asyncio.create_task(inference_coro)
+                execution_controller.controller.register_running_task(task.id, inference_task)
+
                 try:
-                    result = await ollama_client.handle_chat_request(
-                        messages=messages,
-                        model=body.model,
-                        temperature=body.temperature,
-                    )
+                    result = await inference_task
+                    task.response = result
                     usage = result.get("usage", {})
                     auth.record_usage(
                         api_key,
@@ -238,13 +310,21 @@ async def chat_completions(
                         tokens_out=usage.get("completion_tokens", 0),
                     )
                     return JSONResponse(result)
+                except asyncio.CancelledError:
+                    task.status = "cancelled"
+                    raise HTTPException(status_code=499, detail="Request cancelled")
                 except Exception as e:
-                    # Step 8: Never fail silently
+                    task.error = str(e)
                     raise HTTPException(status_code=502, detail=str(e))
                 finally:
+                    task.is_done.set()
                     ACTIVE_REQUESTS -= 1
+        except asyncio.CancelledError:
+             task.status = "cancelled"
+             task.is_done.set()
+             ACTIVE_REQUESTS -= 1
+             raise HTTPException(status_code=499, detail="Client closed connection or request cancelled")
     except Exception as e:
-        # Request failed before entering blocks that handle ACTIVE_REQUESTS
         ACTIVE_REQUESTS -= 1
         raise e
     except Exception as e:

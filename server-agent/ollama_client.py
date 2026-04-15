@@ -45,22 +45,29 @@ async def _verify_connection() -> None:
 
 async def _prepare_model(name: str) -> None:
     """
-    Enforce single active model. 
-    Explicitly loads the model, unloading any others.
+    Ensure the requested model is prepped for inference.
+    If it's already in VRAM, we just note it.
+    If not, we issue a load request.
+    Ollama handles VRAM eviction of other models automatically.
     """
-    active = config.get_active_model()
-    if active and active != name:
-        await unload_model(active)
+    loaded_in_vram = await get_loaded_models()
     
+    if name in loaded_in_vram:
+        config.set_active_model(name)
+        return
+
     # Force load requested model
     try:
+        # Step 4: keep_alive=-1 to ensure residency for the controller's duration
         r = await _retry_post("/api/generate", json_data={
             "model": name,
-            "keep_alive": -1  # Explicitly load and stay in memory
+            "keep_alive": -1
         }, timeout=15.0)
         if r.status_code == 200:
             config.set_active_model(name)
-            config.update_loaded_models([name])
+            # Update cache of what we know is loaded
+            new_loaded = list(loaded_in_vram | {name})
+            config.update_loaded_models(new_loaded)
         else:
             raise RuntimeError(f"Failed to load model {name}: {r.text}")
     except Exception as e:
