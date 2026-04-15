@@ -14,7 +14,8 @@ from pathlib import Path
 import httpx
 import requests
 import json
-import threading
+import time
+from datetime import datetime
 
 import db
 import deploy
@@ -509,7 +510,7 @@ else:
 
     def _proxy_get(host: str, token: str, path: str):
         try:
-            r = requests.get(f"{host}{path}", headers=_agent_headers(token), timeout=5)
+            r = requests.get(f"{host}{path}", headers=_agent_headers(token), timeout=15)
             try:
                 return r.status_code, r.json()
             except ValueError:
@@ -521,7 +522,7 @@ else:
 
     def _proxy_post(host: str, token: str, path: str, body: dict):
         try:
-            r = requests.post(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=5)
+            r = requests.post(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=120)
             try:
                 return r.status_code, r.json()
             except ValueError:
@@ -533,7 +534,7 @@ else:
 
     def _proxy_delete(host: str, token: str, path: str, body: dict):
         try:
-            r = requests.delete(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=5)
+            r = requests.delete(f"{host}{path}", json=body, headers=_agent_headers(token), timeout=15)
             try:
                 return r.status_code, r.json()
             except ValueError:
@@ -583,16 +584,21 @@ else:
             return jsonify({"detail": "Server not found"}), 404
 
         status_code, health = _proxy_get(server["host"], server["admin_token"], "/v1/health")
+        time.sleep(0.15) # Stagger to prevent overwhelming single-worker agent
         metrics_code, metrics_data = _proxy_get(server["host"], server["admin_token"], "/admin/metrics")
+        time.sleep(0.15)
         models_code, models_data = _proxy_get(server["host"], server["admin_token"], "/admin/models")
 
         state = "offline"
         if status_code == 200:
             db.update_server_seen(server_id)
-            if metrics_data and not metrics_data.get("ollama_running"):
+            if metrics_data and not metrics_data.get("ollama_running"): 
                 state = "idle"
-            else:
+            else: 
                 state = "online"
+        
+        # Sync found state back to DB for consistent UI lists
+        db.update_server_status(server_id, state if status_code == 200 else "OFFLINE")
 
         return jsonify({
             "online": status_code == 200,

@@ -360,13 +360,32 @@
         </div>
 
         <div class="card" id="single-model-test-card">
-          <div class="card-title">Test Individual Model</div>
+          <div class="card-title">Test Individual Model (One-off)</div>
           <div style="display:flex;gap:8px;margin-top:8px">
             <input id="test-model-name" placeholder="Model name" style="width:180px"/>
             <input id="test-model-prompt" placeholder="Custom prompt (optional)" style="flex:1"/>
             <button class="btn btn-secondary btn-sm" onclick="runSingleModelTest()">Test</button>
           </div>
           <div id="single-model-result" style="margin-top:12px"></div>
+        </div>
+
+        <!-- NEW: Interactive Chat Console -->
+        <div class="card" id="model-chat-card" style="margin-top:20px">
+          <div class="card-title" style="display:flex; align-items:center; gap:8px;">
+            💬 Interactive Model Chat
+            <span id="chat-active-model-badge" style="margin-left:auto; font-size:11px; font-weight:normal; background:var(--bg3); padding:4px 10px; border-radius:12px; border:1px solid var(--border)">
+              No active model
+            </span>
+          </div>
+          <div id="chat-history" class="log-scroll" style="height:300px; padding:15px; background:var(--bg1); border:1px solid var(--border); border-radius:8px; margin-top:12px; display:flex; flex-direction:column; gap:12px">
+            <div style="text-align:center; color:var(--muted); margin-top:40px">
+              Select a loaded model and start a conversation.
+            </div>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:12px">
+            <input id="chat-input" placeholder="Type a message..." style="flex:1" onkeydown="if(event.key==='Enter') sendChatMessage()"/>
+            <button class="btn btn-primary" id="btn-chat-send" onclick="sendChatMessage()">Send</button>
+          </div>
         </div>
       </div>
 
@@ -773,7 +792,7 @@ function switchTab(tab) {
     if(el) el.classList.toggle('hidden', t!==tab);
   });
   if(tab==='keys') loadKeys(currentServerId);
-  if(tab==='testing') {} // loaded on-demand via buttons
+  if(tab==='testing') { loadTestingTab(); }
   if(tab==='lifecycle') loadLifecycleStatus();
   if(tab==='uptime') loadUptime();
   if(tab==='logs') loadLogs('recent');
@@ -991,6 +1010,7 @@ function renderModelsTable(models) {
         <div style="display:flex;gap:6px">
           ${!isActive ? `<button class="btn btn-secondary btn-sm" onclick="setActiveModel('${m.name}')">Set Active</button>` : ''}
           ${!isLoaded ? `<button class="btn btn-secondary btn-sm" onclick="loadModel('${m.name}')">Load</button>` : `<button class="btn btn-secondary btn-sm" onclick="unloadModel('${m.name}')">Unload</button>`}
+          <button class="btn btn-secondary btn-sm" onclick="goToTestModel('${m.name}')" title="Test Model">🧪</button>
           <button class="btn btn-danger btn-sm" onclick="deleteModel('${m.name}')" title="Delete Model">🗑️</button>
         </div>
       </td>
@@ -1190,7 +1210,75 @@ async function runSingleModelTest() {
       ${data.error?`<div style="margin-top:8px;color:var(--danger);font-size:12px;background:rgba(239,68,68,0.1);padding:8px;border-radius:4px;border:1px solid rgba(239,68,68,0.2)">${data.error}</div>`:''}
     `;
     loadTestingTab(); // update health
+    $('test-model-name').value = data.model; // Ensure name is sync'd
   } catch(e) { $('single-model-result').innerHTML = `<span style="color:var(--danger)">${e.message}</span>`; }
+}
+
+function goToTestModel(name) {
+  showView('server-detail');
+  switchTab('testing');
+  $('test-model-name').value = name;
+  $('test-model-prompt').focus();
+}
+
+let chatMessages = [];
+async function sendChatMessage() {
+  const input = $('chat-input');
+  const text = input.value.trim();
+  if(!text) return;
+  
+  const model = $('test-model-name').value.trim();
+  if(!model) { toast('Please specify or load a model in the "Load/Test" section first.', 'warn'); return; }
+
+  // Add user message
+  chatMessages.push({role:'user', content:text});
+  renderChat();
+  input.value = '';
+  
+  const historyEl = $('chat-history');
+  const loadingMsg = document.createElement('div');
+  loadingMsg.style.color = 'var(--muted)';
+  loadingMsg.innerHTML = '<span class="spin" style="width:12px;height:12px;display:inline-block"></span> Assistant is thinking...';
+  historyEl.appendChild(loadingMsg);
+  historyEl.scrollTop = historyEl.scrollHeight;
+
+  try {
+    const data = await apiFetch(`/api/servers/${currentServerId}/proxy/v1/chat/completions`, {
+      method:'POST', body:{model, messages:chatMessages}
+    });
+    
+    // Remove loading
+    historyEl.removeChild(loadingMsg);
+
+    if(data.choices && data.choices[0]) {
+      const resp = data.choices[0].message;
+      chatMessages.push(resp);
+      renderChat();
+    } else if(data.error) {
+       throw new Error(data.error.message || data.error);
+    }
+  } catch(e) {
+    historyEl.removeChild(loadingMsg);
+    toast(e.message, 'error');
+    console.error(e);
+  }
+}
+
+function renderChat() {
+  const el = $('chat-history');
+  if(!chatMessages.length) {
+    el.innerHTML = '<div style="text-align:center;color:var(--muted);margin-top:40px">Select a model and start a conversation.</div>';
+    return;
+  }
+  el.innerHTML = chatMessages.map(m => `
+    <div style="align-self: ${m.role==='user'?'flex-end':'flex-start'}; max-width: 85%;">
+      <div style="font-size:10px; color:var(--muted); margin-bottom:4px; text-align: ${m.role==='user'?'right':'left'}">${m.role.toUpperCase()}</div>
+      <div style="background: ${m.role==='user'? 'var(--accent)' : 'var(--bg3)'}; color: ${m.role==='user'?'#fff':'var(--text)'}; padding: 10px 14px; border-radius: 12px; font-size: 13px; line-height: 1.4; border: 1px solid var(--border)">
+        ${m.content.replace(/\n/g, '<br>')}
+      </div>
+    </div>
+  `).join('');
+  el.scrollTop = el.scrollHeight;
 }
 
 async function loadTestingTab() {
@@ -1224,6 +1312,16 @@ async function loadTestingTab() {
       </div>
     `;
     el.innerHTML = html;
+    
+    // Update Chat UI
+    const badge = $('chat-active-model-badge');
+    if(badge) {
+      badge.textContent = health.active_model ? `Acting: ${health.active_model}` : 'No active model';
+      badge.style.color = health.active_model ? 'var(--accent2)' : 'var(--muted)';
+    }
+    if(health.active_model && !$('test-model-name').value) {
+      $('test-model-name').value = health.active_model;
+    }
   } catch(e) {
     el.innerHTML = `<span style="color:var(--danger)">Ready to check... (Issue: ${e.message})</span>`;
   }

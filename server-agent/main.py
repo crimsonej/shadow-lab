@@ -202,13 +202,6 @@ async def chat_completions(
     ACTIVE_REQUESTS += 1
     
     try:
-        # Inject active model if not specified
-        if not body.model:
-            active = config.get_active_model()
-            if not active:
-                raise HTTPException(400, "No model selected. Provide ‘model’ or select an active model in dashboard.")
-            body.model = active
-
         messages = [m.model_dump() for m in body.messages]
 
         async with _semaphore:
@@ -217,14 +210,12 @@ async def chat_completions(
                     prompt_tokens = 0
                     completion_tokens = 0
                     try:
-                        async for chunk in ollama_client.chat_completion_stream(
-                            model=body.model,
+                        async for chunk in ollama_client.handle_chat_stream_request(
                             messages=messages,
+                            model=body.model,
                             temperature=body.temperature,
-                            max_tokens=body.max_tokens,
                         ):
                             yield chunk.encode()
-                            # rough token counting for usage
                             completion_tokens += 1
                     except Exception as e:
                         log.error(f"Streaming error: {e}")
@@ -235,24 +226,27 @@ async def chat_completions(
                 return StreamingResponse(event_stream(), media_type="text/event-stream")
             else:
                 try:
-                    result = await ollama_client.chat_completion(
-                        model=body.model,
+                    result = await ollama_client.handle_chat_request(
                         messages=messages,
+                        model=body.model,
                         temperature=body.temperature,
-                        max_tokens=body.max_tokens,
                     )
+                    usage = result.get("usage", {})
+                    auth.record_usage(
+                        api_key,
+                        tokens_in=usage.get("prompt_tokens", 0),
+                        tokens_out=usage.get("completion_tokens", 0),
+                    )
+                    return JSONResponse(result)
                 except Exception as e:
-                    raise HTTPException(status_code=502, detail=f"Ollama error: {e}")
+                    # Step 8: Never fail silently
+                    raise HTTPException(status_code=502, detail=str(e))
                 finally:
                     ACTIVE_REQUESTS -= 1
-
-                usage = result.get("usage", {})
-                auth.record_usage(
-                    api_key,
-                    tokens_in=usage.get("prompt_tokens", 0),
-                    tokens_out=usage.get("completion_tokens", 0),
-                )
-                return JSONResponse(result)
+    except Exception as e:
+        # Request failed before entering blocks that handle ACTIVE_REQUESTS
+        ACTIVE_REQUESTS -= 1
+        raise e
     except Exception as e:
         # This catch is for errors *before* the inner finally blocks are set up (like messages parsing or semaphore issues)
         # However, we must be careful not to double-decrement if the error happened inside the non-streaming try block.
@@ -431,38 +425,38 @@ async def api_health():
 @app.post("/api/test-model", tags=["Reliability"])
 async def api_test_model(body: schemas.TestModelRequest, _: str = Depends(require_admin)):
     """Verify if a model is callable with a strict 10s timeout, using standardized test logic."""
-    # Ensure model is "active" or load it temporarily? 
-    # The prompt says: "Ensure model is loaded"
-    active = config.get_active_model()
-    if active != body.name:
-        log.info(f"Test requested for non-active model {body.name}. Loading now...")
-        # This will trigger our single-model load logic
-        await ollama_client.load_model(body.name)
+    import time
+    start_time = time.monotonic()
     
-    # Use the model_tester logic to get a standardized response
-    # We wrap it in a try-except to guarantee it never crashes the server
     try:
-        result = await asyncio.wait_for(
-            model_tester.test_model(
-                model_name=body.name,
-                prompt=body.prompt or "Say OK if working."
-            ),
-            timeout=12.0 # 10s target + 2s buffer
+        # Force load and inference via our new deterministic wrapper
+        result = await ollama_client.chat_completion(
+            model=body.name,
+            messages=[{"role": "user", "content": "Reply with the word OK only"}],
+            temperature=0.0,
+            max_tokens=10
         )
-        return result
-    except asyncio.TimeoutError:
-        return {
-            "model": body.name,
-            "status": "fail",
-            "error": "Inference timed out after 10 seconds",
-            "latency_ms": 10000.0
-        }
+        
+        response_text = result["choices"][0]["message"]["content"].strip()
+        latency_ms = round((time.monotonic() - start_time) * 1000)
+        
+        if "OK" in response_text.upper():
+            return {
+                "status": "success",
+                "model": body.name,
+                "latency": str(latency_ms),
+                "response": "OK"
+            }
+        else:
+            return {
+                "status": "error",
+                "reason": f"Expected 'OK', got '{response_text}'"
+            }
+            
     except Exception as e:
         return {
-            "model": body.name,
-            "status": "fail",
-            "error": str(e),
-            "latency_ms": 0
+            "status": "error",
+            "reason": str(e)
         }
 
 

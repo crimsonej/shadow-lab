@@ -8,8 +8,10 @@ import json
 from typing import AsyncIterator, List, Optional, Dict, Any
 
 import httpx
+import time
 
 import config
+import structured_logger
 
 # Shared async client (connection-pooled)
 _client: Optional[httpx.AsyncClient] = None
@@ -24,7 +26,7 @@ def get_client() -> httpx.AsyncClient:
     return _client
 
 async def _retry_post(path: str, json_data: Dict[str, Any], timeout: float = 10.0) -> httpx.Response:
-    """Wrapper to try an Ollama POST request with 1x immediate retry on timeout."""
+    """Wrapper to try an Ollama POST request with 1x immediate retry on timeout or disconnect."""
     import httpx
     client = get_client()
     try:
@@ -32,6 +34,37 @@ async def _retry_post(path: str, json_data: Dict[str, Any], timeout: float = 10.
     except (httpx.TimeoutException, httpx.ConnectError):
         # 1 Retry
         return await client.post(path, json=json_data, timeout=timeout)
+
+async def _verify_connection() -> None:
+    """Check if Ollama is responsive before proceeding."""
+    try:
+        r = await get_client().get("/api/tags", timeout=3.0)
+        r.raise_for_status()
+    except Exception:
+        raise RuntimeError("ollama_offline")
+
+async def _prepare_model(name: str) -> None:
+    """
+    Enforce single active model. 
+    Explicitly loads the model, unloading any others.
+    """
+    active = config.get_active_model()
+    if active and active != name:
+        await unload_model(active)
+    
+    # Force load requested model
+    try:
+        r = await _retry_post("/api/generate", json_data={
+            "model": name,
+            "keep_alive": -1  # Explicitly load and stay in memory
+        }, timeout=15.0)
+        if r.status_code == 200:
+            config.set_active_model(name)
+            config.update_loaded_models([name])
+        else:
+            raise RuntimeError(f"Failed to load model {name}: {r.text}")
+    except Exception as e:
+        raise RuntimeError(f"Could not load model {name}: {str(e)}")
 
 
 # ── Model management ──────────────────────────────────────────────────────────
@@ -69,29 +102,10 @@ async def get_loaded_models() -> set[str]:
         return set()
 
 async def load_model(name: str) -> bool:
-    """Pre-load a model into VRAM while strictly enforcing single-model active state."""
-    # Enforce unloading of any previously loaded models according to current state
-    active = config.get_active_model()
-    if active and active != name:
-        await unload_model(active)
-    
-    # Also check if anything else is lingering in VRAM
-    loaded = await get_loaded_models()
-    for mod in loaded:
-        if mod != name:
-            await unload_model(mod)
-
+    """Public wrapper to preload a model."""
     try:
-        r = await _retry_post("/api/generate", json_data={
-            "model": name,
-            "keep_alive": -1  # Load and keep indefinitely until unloaded
-        }, timeout=15.0)
-        
-        if r.status_code == 200:
-            config.set_active_model(name)
-            config.update_loaded_models([name])
-            return True
-        return False
+        await _prepare_model(name)
+        return True
     except Exception:
         return False
 
@@ -139,12 +153,114 @@ async def show_model(name: str) -> Dict[str, Any]:
 
 # ── Chat / completions ────────────────────────────────────────────────────────
 
-def _openai_messages_to_ollama(messages: List[Dict]) -> List[Dict]:
+def format_messages(messages: List[Dict[str, str]]) -> str:
     """
-    OpenAI message format → Ollama chat format.
-    Ollama uses role/content identical to OpenAI for chat.
+    Convert OpenAI-style messages to a plain text prompt.
+    User: Hello\nAssistant: Hi\nUser: How are you\nAssistant:
     """
-    return messages  # already compatible
+    prompt_parts = []
+    for msg in messages:
+        role = msg.get("role", "user").capitalize()
+        content = msg.get("content", "")
+        prompt_parts.append(f"{role}: {content}")
+    
+    # Prepend 'Assistant: ' to trigger response if not already there
+    prompt = "\n".join(prompt_parts)
+    if not prompt.endswith("Assistant:"):
+        prompt += "\nAssistant:"
+    return prompt
+
+
+async def generate_response(model: str, prompt: str, temperature: float = 0.7) -> Dict[str, Any]:
+    """
+    Step 4: Unified Generate Call.
+    Uses /api/generate with keep_alive=-1 and 10s timeout + retry.
+    """
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature
+        },
+        "keep_alive": -1
+    }
+
+    start_time = time.monotonic()
+    slog = structured_logger.get_logger()
+    
+    try:
+        # Step 4: 10s timeout + 1 retry
+        r = await _retry_post("/api/generate", json_data=payload, timeout=10.0)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        latency = (time.monotonic() - start_time) * 1000
+        slog.error("Ollama Generate Failed", model=model, latency_ms=latency, error=str(e))
+        raise RuntimeError(f"Ollama backend failure: {str(e)}")
+
+    latency = (time.monotonic() - start_time) * 1000
+    slog.info("Ollama Generate Request", model=model, latency_ms=latency, success=True)
+    return data
+
+
+async def handle_chat_request(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.7,
+) -> Dict[str, Any]:
+    """
+    Step 3: Master Execution Function.
+    1. Validate
+    2. Resolve model
+    3. Ensure model is loaded (switching if needed)
+    4. Convert messages -> prompt
+    5. Call Ollama
+    6. Validate response
+    7. Return OpenAI style
+    """
+    # Step 7: Fail-safe check
+    await _verify_connection()
+
+    # Step 2: Resolve model
+    target_model = model or config.get_active_model()
+    if not target_model:
+        raise ValueError("no_model_specified")
+
+    # Step 6: Switch model if needed
+    await _prepare_model(target_model)
+
+    # Step 2: Convert messages -> prompt
+    prompt = format_messages(messages)
+
+    # Step 4: Call Ollama
+    try:
+        data = await generate_response(target_model, prompt, temperature)
+    except Exception as e:
+        # Step 8: Never fail silently
+        raise RuntimeError(f"inference_failed: {str(e)}")
+
+    # Step 5: OpenAI Style Response
+    return {
+        "id": f"chatcmpl-{asyncio.get_event_loop().time():.0f}",
+        "object": "chat.completion",
+        "model": target_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": data.get("response", ""),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": data.get("prompt_eval_count", 0),
+            "completion_tokens": data.get("eval_count", 0),
+            "total_tokens": data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
+        },
+    }
 
 
 async def chat_completion(
@@ -155,48 +271,100 @@ async def chat_completion(
     stream: bool = False,
 ) -> Dict[str, Any]:
     """
-    Non-streaming chat completion.
-    Returns an OpenAI-compatible response dict.
+    Non-streaming chat completion (delegates to handle_chat_request).
     """
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": _openai_messages_to_ollama(messages),
-        "stream": False,
-        "options": {"temperature": temperature},
+    # Note: handle_chat_request handles health, model swtiching, and formatting.
+    return await handle_chat_request(messages, model=model, temperature=temperature)
+
+
+async def handle_chat_stream_request(
+    messages: List[Dict[str, str]],
+    model: Optional[str] = None,
+    temperature: float = 0.7,
+) -> AsyncIterator[str]:
+    """
+    Streaming version of Step 3.
+    """
+    # Step 7: Fail-safe check
+    await _verify_connection()
+
+    # Step 2: Resolve model
+    target_model = model or config.get_active_model()
+    if not target_model:
+        raise ValueError("no_model_specified")
+
+    # Step 6: Switch model if needed
+    await _prepare_model(target_model)
+
+    # Step 2: Convert messages -> prompt
+    prompt = format_messages(messages)
+
+    payload = {
+        "model": target_model,
+        "prompt": prompt,
+        "stream": True,
+        "options": {
+            "temperature": temperature
+        },
+        "keep_alive": -1
     }
-    if max_tokens:
-        payload["options"]["num_predict"] = max_tokens
+
+    chunk_id = f"chatcmpl-stream-{asyncio.get_event_loop().time():.0f}"
+    slog = structured_logger.get_logger()
+    start_time = time.monotonic()
 
     try:
-        r = await _retry_post("/api/chat", json_data=payload, timeout=15.0)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        raise RuntimeError(f"Ollama backend failure: {str(e)}")
+        # Step 4: Call Ollama with simple retry logic for the stream setup
+        client = get_client()
+        try:
+            req = client.build_request("POST", "/api/generate", json=payload)
+            resp = await client.send(req, stream=True, timeout=httpx.Timeout(10.0, connect=5.0))
+        except (httpx.TimeoutException, httpx.ConnectError):
+            req = client.build_request("POST", "/api/generate", json=payload)
+            resp = await client.send(req, stream=True, timeout=httpx.Timeout(10.0, connect=5.0))
 
-    # Build OpenAI-compatible response
-    return {
-        "id": f"chatcmpl-{asyncio.get_event_loop().time():.0f}",
-        "object": "chat.completion",
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": data["message"]["content"],
-                },
-                "finish_reason": "stop",
+        resp.raise_for_status()
+        
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            content = data.get("response", "")
+            done = data.get("done", False)
+
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "model": target_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": content},
+                        "finish_reason": "stop" if done else None,
+                    }
+                ],
             }
-        ],
-        "usage": {
-            "prompt_tokens": data.get("prompt_eval_count", 0),
-            "completion_tokens": data.get("eval_count", 0),
-            "total_tokens": (
-                data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
-            ),
-        },
-    }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            if done:
+                yield "data: [DONE]\n\n"
+                latency = (time.monotonic() - start_time) * 1000
+                slog.info("Ollama Stream Generate Request", model=target_model, latency_ms=latency, success=True)
+                break
+    except Exception as e:
+        latency = (time.monotonic() - start_time) * 1000
+        slog.error("Ollama Stream Generate Failed", model=target_model, latency_ms=latency, error=str(e))
+        err_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "model": target_model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"\n[Backend Error: {str(e)}]"}, "finish_reason": "error"}],
+        }
+        yield f"data: {json.dumps(err_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 async def chat_completion_stream(
@@ -206,61 +374,9 @@ async def chat_completion_stream(
     max_tokens: Optional[int] = None,
 ) -> AsyncIterator[str]:
     """
-    Streaming chat completion.
-    Yields Server-Sent Event strings in OpenAI format.
+    Streaming chat completion (delegates to handle_chat_stream_request).
     """
-    payload: Dict[str, Any] = {
-        "model": model,
-        "messages": _openai_messages_to_ollama(messages),
-        "stream": True,
-        "options": {"temperature": temperature},
-    }
-    if max_tokens:
-        payload["options"]["num_predict"] = max_tokens
-
-    chunk_id = f"chatcmpl-stream-{asyncio.get_event_loop().time():.0f}"
-    import httpx
-
-    try:
-        async with get_client().stream("POST", "/api/chat", json=payload, timeout=httpx.Timeout(15.0, connect=5.0)) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                content = data.get("message", {}).get("content", "")
-                done = data.get("done", False)
-
-                chunk = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": content},
-                            "finish_reason": "stop" if done else None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-                if done:
-                    yield "data: [DONE]\n\n"
-                    break
-    except Exception as e:
-        # Gracefully handle the error by emitting an SSE encoded error string
-        err_chunk = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"\n[Backend Error: {str(e)}]"}, "finish_reason": "error"}],
-        }
-        yield f"data: {json.dumps(err_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+    return handle_chat_stream_request(messages, model=model, temperature=temperature)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
