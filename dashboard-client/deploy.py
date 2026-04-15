@@ -124,6 +124,19 @@ def run_deployment(deploy_id, host, port, username,
         else:
             _log(deploy_id, f"✓ OS detected (package manager: {pkg_mgr})")
 
+        # ── 2b. Resource Check (Pre-Flight) ───────────────────────────────
+        _log(deploy_id, "Checking server resources...")
+        _, mem_info, _ = _exec(ssh, "free -m | grep Mem | awk '{print $2}'", deploy_id, "Memory check")
+        try:
+            total_ram = int(mem_info)
+            if total_ram < 3500: # Allow some jitter
+                _log(deploy_id, f"⚠ WARNING: Server has only {total_ram}MB RAM. Minimum recommended for provider use is 4GB.")
+                _log(deploy_id, "  Inference may be extremely slow or unstable.")
+            else:
+                _log(deploy_id, f"✓ Memory: {total_ram}MB (Pass)")
+        except:
+            _log(deploy_id, "⚠ Could not determine RAM accurately. Continuing...")
+
         # ── 3. Install system prerequisites ───────────────────────────────
         _log(deploy_id, "Installing system prerequisites...")
         rc, _, _ = _exec(ssh, install_cmd, deploy_id,

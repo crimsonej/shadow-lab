@@ -12,6 +12,7 @@ import time
 
 import config
 import structured_logger
+import hardware_optimizer
 
 # Shared async client (connection-pooled)
 _client: Optional[httpx.AsyncClient] = None
@@ -183,13 +184,16 @@ async def generate_response(model: str, prompt: str, temperature: float = 0.7) -
     Step 4: Unified Generate Call.
     Uses /api/generate with keep_alive=-1 and 10s timeout + retry.
     """
+    # Infrastructure Tuning: Get presets for this specific VPS
+    presets = hardware_optimizer.get_optimal_options({
+        "temperature": temperature
+    })
+
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {
-            "temperature": temperature
-        },
+        "options": presets,
         "keep_alive": -1
     }
 
@@ -218,13 +222,7 @@ async def handle_chat_request(
 ) -> Dict[str, Any]:
     """
     Step 3: Master Execution Function.
-    1. Validate
-    2. Resolve model
-    3. Ensure model is loaded (switching if needed)
-    4. Convert messages -> prompt
-    5. Call Ollama
-    6. Validate response
-    7. Return OpenAI style
+    Optimized for 'Resident Intelligence' identity and hardware tuning.
     """
     # Step 7: Fail-safe check
     await _verify_connection()
@@ -236,6 +234,18 @@ async def handle_chat_request(
 
     # Step 6: Switch model if needed
     await _prepare_model(target_model)
+
+    # Step: Inject Host Identity (Resident Intelligence)
+    # Only inject if messages present and first isn't already a system prompt
+    if messages and messages[0].get("role") != "system":
+        sys_info = hardware_optimizer.get_system_metadata()
+        identity = (
+            f"You are the Shadow-Lab Resident Intelligence. "
+            f"Environment: {sys_info['os']} on {sys_info['nodename']}. "
+            f"Hardware: {sys_info['cores']} cores, {sys_info['ram_mb']}MB RAM. "
+            f"You are optimized for high-performance sequential inference on this specific VPS."
+        )
+        messages.insert(0, {"role": "system", "content": identity})
 
     # Step 2: Convert messages -> prompt
     prompt = format_messages(messages)

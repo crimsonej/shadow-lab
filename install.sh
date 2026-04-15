@@ -149,6 +149,69 @@ install_python() {
   fi
 }
 
+# ── Hardware Profiling ────────────────────────────────────────────────────────
+detect_hardware() {
+  info "Profiling hardware for optimization..."
+  CORES=$(nproc)
+  RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+  RAM_MB=$((RAM_KB / 1024))
+  
+  # Determine logical concurrency (conservative)
+  if [ "$CORES" -le 2 ]; then
+    MAX_CONCURRENT=1
+  elif [ "$CORES" -le 4 ]; then
+    MAX_CONCURRENT=2
+  else
+    MAX_CONCURRENT=$((CORES / 2))
+  fi
+  
+  # Detect GPU
+  HAS_GPU=false
+  if lspci 2>/dev/null | grep -i "nvidia" >/dev/null; then
+    HAS_GPU=true
+  fi
+  
+  info "Hardware: $CORES cores, ${RAM_MB}MB RAM, GPU: $HAS_GPU"
+}
+
+# ── OS Hardening & Tuning ─────────────────────────────────────────────────────
+tune_system() {
+  info "Applying OS performance hardening..."
+  
+  # 1. Swap Management (Critical for low-RAM VPS)
+  if [ "$RAM_MB" -lt 16384 ]; then
+    if [ ! -f /swapfile ]; then
+      info "Creating 4GB swap file for memory stability..."
+      fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096 2>/dev/null
+      chmod 600 /swapfile
+      mkswap /swapfile >/dev/null
+      swapon /swapfile >/dev/null
+      echo "/swapfile none swap sw 0 0" >> /etc/fstab
+      success "Swap file enabled"
+    else
+      success "Swap already present"
+    fi
+  fi
+  
+  # 2. Sysctl Tuning
+  info "Tuning kernel parameters (sysctl)..."
+  cat > /etc/sysctl.d/99-shadow-lab.conf <<EOF
+# Provider-grade low-latency AI tuning
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+vm.overcommit_memory=1
+kernel.sched_latency_ns=10000000
+kernel.sched_migration_cost_ns=500000
+EOF
+  sysctl -p /etc/sysctl.d/99-shadow-lab.conf &>/dev/null || true
+  
+  # 3. Transparent Huge Pages (THP)
+  if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+    echo "madvise" > /sys/kernel/mm/transparent_hugepage/enabled
+    info "THP set to 'madvise' for model performance."
+  fi
+}
+
 # ── Ollama ────────────────────────────────────────────────────────────────────
 install_ollama() {
   if command -v ollama &>/dev/null; then
@@ -221,8 +284,8 @@ AGENT_PORT=${AGENT_PORT}
 AGENT_HOST=0.0.0.0
 ADMIN_TOKEN=${ADMIN_TOKEN}
 KEYS_FILE=${KEYS_DIR}/keys.json
-MAX_CONCURRENT=4
-GPU_MONITORING=true
+MAX_CONCURRENT=${MAX_CONCURRENT:-2}
+GPU_MONITORING=${HAS_GPU:-false}
 EOF
   chmod 600 "$ENV_FILE"
   success "Admin token generated and saved to $ENV_FILE"
@@ -245,8 +308,10 @@ EnvironmentFile=${AGENT_DIR}/.env
 ExecStart=${AGENT_DIR}/venv/bin/python main.py
 Restart=always
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
+# Provider Protection: Avoid OOM killer
+OOMScoreAdjust=-1000
+LimitNOFILE=65535
+EOF
 
 [Install]
 WantedBy=multi-user.target
@@ -359,6 +424,8 @@ main() {
   banner
   check_root
   detect_os
+  detect_hardware
+  tune_system
   pkg_update
   PYTHON_BIN="python3"  # may be overridden by install_python
   install_python
